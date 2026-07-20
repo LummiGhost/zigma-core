@@ -1,0 +1,29 @@
+{
+  "callerContext": {
+    "actor": {
+      "type": "user",
+      "id": "local-operator"
+    },
+    "capabilities": [
+      "task:start",
+      "workflow:invoke",
+      "workspace:create",
+      "workspace:write",
+      "gate:approve",
+      "gate:reject"
+    ],
+    "constraints": {
+      "repositoryIds": ["primary"],
+      "workflowRefs": ["code-change"],
+      "toolNames": ["git", "npm", "zigma-workspace"],
+      "branchPatterns": ["zigma/*"],
+      "maxRunDurationMs": 3600000
+    },
+    "source": {
+      "kind": "cli",
+      "metadata": {}
+    }
+  },
+  "inputs": {},
+  "dryRun": false
+}

@@ -1,0 +1,244 @@
+# Zigma Core API Contracts
+
+Version: `v1` MVP
+
+Base path: `/v1`
+
+All successful responses use:
+
+```json
+{
+  "data": {}
+}
+```
+
+All errors use:
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Request validation failed",
+    "details": []
+  }
+}
+```
+
+## Execution profiles
+
+### `POST /execution-profiles`
+
+Registers how Core invokes `zigma-flow` and `zigma-workspace`.
+
+```json
+{
+  "name": "local-cli",
+  "mode": "local-cli",
+  "flowCommand": "zigma-flow",
+  "workspaceCommand": "zigma-workspace",
+  "timeoutMs": 3600000,
+  "environment": {},
+  "metadata": {}
+}
+```
+
+### `GET /execution-profiles/:id`
+
+Returns one execution profile.
+
+## Projects
+
+### `POST /projects`
+
+Registers a project and its execution defaults.
+
+```json
+{
+  "key": "zigma-core",
+  "displayName": "Zigma Core",
+  "repositories": [
+    {
+      "id": "primary",
+      "provider": "github",
+      "url": "https://github.com/LummiGhost/zigma-core.git",
+      "defaultRef": "main",
+      "writable": true,
+      "metadata": {}
+    }
+  ],
+  "defaultRepositoryId": "primary",
+  "defaultWorkflowRef": "code-change",
+  "executionProfileId": "profile_...",
+  "workspacePolicy": {
+    "provider": "zigma-workspace-cli",
+    "mode": "writable",
+    "branchTemplate": "zigma/{taskId}",
+    "cleanup": "manual",
+    "snapshotOnTerminal": true
+  },
+  "metadata": {}
+}
+```
+
+### `GET /projects/:id`
+
+Accepts a project ID or project key.
+
+## Tasks
+
+### `POST /tasks`
+
+```json
+{
+  "projectId": "project_...",
+  "title": "Implement project model",
+  "description": "Implement the project model and tests.",
+  "priority": "high",
+  "source": {
+    "kind": "api",
+    "metadata": {}
+  },
+  "createdBy": {
+    "type": "user",
+    "id": "user-1"
+  },
+  "labels": ["mvp"],
+  "metadata": {}
+}
+```
+
+### `GET /tasks/:id`
+
+Returns a Task View containing the task, project, flow attempts, active workspace, and current evidence bundle.
+
+### `POST /tasks/:id/start`
+
+The current local adapter executes synchronously, though the transport returns HTTP 202 to preserve the future asynchronous contract.
+
+```json
+{
+  "callerContext": {
+    "actor": {
+      "type": "user",
+      "id": "user-1"
+    },
+    "capabilities": [
+      "task:start",
+      "workflow:invoke",
+      "workspace:create",
+      "workspace:write"
+    ],
+    "constraints": {
+      "repositoryIds": ["primary"],
+      "workflowRefs": ["code-change"],
+      "toolNames": ["git", "npm", "zigma-workspace"],
+      "branchPatterns": ["zigma/*"],
+      "maxRunDurationMs": 3600000
+    },
+    "source": {
+      "kind": "api",
+      "metadata": {}
+    }
+  },
+  "inputs": {},
+  "dryRun": false
+}
+```
+
+### `POST /tasks/:id/cancel`
+
+```json
+{
+  "reason": "Cancelled by operator"
+}
+```
+
+## Flow events
+
+### `POST /flow-runs/:id/events`
+
+Provides an idempotent status callback contract for `zigma-flow` or a future execution host.
+
+```json
+{
+  "eventId": "event-019...",
+  "externalRunId": "2026-07-20T...",
+  "type": "run.completed",
+  "occurredAt": "2026-07-20T03:00:00.000Z",
+  "summary": "All jobs completed",
+  "payload": {}
+}
+```
+
+Event types:
+
+- `run.started`
+- `run.progress`
+- `run.awaiting-human`
+- `run.completed`
+- `run.failed`
+- `run.cancelled`
+
+## Human Gates
+
+### `POST /human-gates`
+
+```json
+{
+  "externalGateId": "gate-merge",
+  "taskId": "task_...",
+  "flowRunId": "flowrun_...",
+  "jobId": "merge",
+  "stepId": "approval",
+  "prompt": "Approve the proposed change?",
+  "inputSchema": {},
+  "allowedApprovers": [
+    {
+      "type": "user",
+      "id": "user-1"
+    }
+  ],
+  "metadata": {}
+}
+```
+
+### `POST /human-gates/:id/decisions`
+
+```json
+{
+  "actor": {
+    "type": "user",
+    "id": "user-1"
+  },
+  "decision": "approve",
+  "comment": "Approved after review",
+  "input": {},
+  "callerCapabilities": ["gate:approve"]
+}
+```
+
+## Evidence
+
+### `POST /flow-runs/:id/evidence`
+
+Adds an Evidence Item to the open bundle.
+
+### `GET /flow-runs/:id/evidence`
+
+Returns the bundle and ordered items.
+
+### `POST /flow-runs/:id/evidence/finalize`
+
+```json
+{
+  "summary": "Implementation and validation completed.",
+  "risks": [],
+  "conclusions": ["Ready for review"]
+}
+```
+
+## Audit
+
+### `GET /tasks/:id/audit-events`
+
+Returns append-only task aggregate events in creation order.

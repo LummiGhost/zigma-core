@@ -1,0 +1,26 @@
+{
+  "key": "zigma-core",
+  "displayName": "Zigma Core",
+  "description": "Zigma platform control plane",
+  "repositories": [
+    {
+      "id": "primary",
+      "provider": "github",
+      "url": "https://github.com/LummiGhost/zigma-core.git",
+      "defaultRef": "main",
+      "writable": true,
+      "metadata": {}
+    }
+  ],
+  "defaultRepositoryId": "primary",
+  "defaultWorkflowRef": "code-change",
+  "executionProfileId": "REPLACE_WITH_PROFILE_ID",
+  "workspacePolicy": {
+    "provider": "zigma-workspace-cli",
+    "mode": "writable",
+    "branchTemplate": "zigma/{taskId}",
+    "cleanup": "manual",
+    "snapshotOnTerminal": true
+  },
+  "metadata": {}
+}
