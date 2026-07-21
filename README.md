@@ -27,7 +27,7 @@ Distributed execution, organization membership, policy languages, mail ingestion
 - `zigma-flow` available on `PATH` for real workflow execution
 - `zigma-workspace` available on `PATH` when a project uses the workspace CLI provider
 
-The MVP uses Node's built-in SQLite module. The persistence implementation is isolated in `SqliteStore`, so a future PostgreSQL adapter can preserve the application and API contracts.
+The MVP standardizes on Node.js 22 and uses the built-in `node:sqlite` module. `better-sqlite3` remains a possible optional adapter for deployments that need its native implementation, but it is not a runtime dependency and the MVP does not migrate to it. Persistence remains isolated in `SqliteStore` so a later adapter can preserve the application and API contracts.
 
 ## Development
 

@@ -25,7 +25,9 @@ const flowTransitions: Record<FlowRunStatus, ReadonlySet<FlowRunStatus>> = {
 };
 
 const gateTransitions: Record<GateStatus, ReadonlySet<GateStatus>> = {
-  awaiting: new Set(["approved", "rejected", "expired", "cancelled"]),
+  awaiting: new Set(["decision_pending", "expired", "cancelled"]),
+  decision_pending: new Set(["decision_failed", "approved", "rejected"]),
+  decision_failed: new Set(["decision_pending", "expired", "cancelled"]),
   approved: new Set(),
   rejected: new Set(),
   expired: new Set(),

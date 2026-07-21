@@ -19,7 +19,14 @@ export type TaskStatus =
   | "completed"
   | "failed"
   | "cancelled";
-export type GateStatus = "awaiting" | "approved" | "rejected" | "expired" | "cancelled";
+export type GateStatus =
+  | "awaiting"
+  | "decision_pending"
+  | "decision_failed"
+  | "approved"
+  | "rejected"
+  | "expired"
+  | "cancelled";
 export type WorkspaceStatus = "preparing" | "ready" | "active" | "released" | "failed";
 export type EvidenceBundleStatus = "open" | "finalized";
 
@@ -154,7 +161,10 @@ export interface HumanDecision {
   decision: "approve" | "reject";
   comment?: string;
   input: Record<string, unknown>;
+  deliveryStatus: "pending" | "failed" | "delivered";
+  lastError?: string;
   createdAt: string;
+  updatedAt: string;
 }
 
 export interface EvidenceBundle {

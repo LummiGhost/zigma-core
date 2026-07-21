@@ -13,6 +13,7 @@ import type {
   WorkspaceProvider
 } from "../src/contracts/ports.js";
 import { CoreService } from "../src/application/core-service.js";
+import type { DecideHumanGateInput } from "../src/contracts/schemas.js";
 import { SqliteStore } from "../src/persistence/sqlite-store.js";
 import { ForbiddenError } from "../src/domain/errors.js";
 
@@ -34,6 +35,7 @@ class FakeIds implements IdGenerator {
 
 class FakeFlow implements FlowExecutor {
   readonly decisions: FlowGateDecisionRequest[] = [];
+  decisionError?: Error;
   result: FlowStartResult = {
     externalRunId: "zf-run-1",
     status: "completed",
@@ -48,6 +50,7 @@ class FakeFlow implements FlowExecutor {
 
   async decideGate(request: FlowGateDecisionRequest): Promise<void> {
     this.decisions.push(request);
+    if (this.decisionError) throw this.decisionError;
   }
 }
 
@@ -144,7 +147,7 @@ function setup() {
     labels: ["mvp"],
     metadata: {}
   });
-  return { core, flow, project, task };
+  return { core, flow, store, project, task };
 }
 
 function startInput() {
@@ -242,6 +245,53 @@ describe("CoreService", () => {
       payload: {}
     });
     expect(duplicate.task.status).toBe("completed");
+  });
+
+  it("keeps failed human gate delivery retryable and finalizes it after retry", async () => {
+    const { core, flow, store, task } = setup();
+    flow.result = {
+      externalRunId: "zf-paused-retry",
+      status: "awaiting_human",
+      exitCode: 0,
+      metadata: {}
+    };
+    const run = (await core.startTask(task.id, startInput())).activeFlowRun!;
+    const gate = core.createHumanGate({
+      externalGateId: "gate-retry",
+      taskId: task.id,
+      flowRunId: run.id,
+      jobId: "review",
+      stepId: "approval",
+      prompt: "Approve?",
+      inputSchema: {},
+      allowedApprovers: [{ type: "user", id: "owner" }],
+      metadata: {}
+    });
+    const input: DecideHumanGateInput = {
+      actor: { type: "user" as const, id: "owner" },
+      decision: "approve" as const,
+      comment: "retry me",
+      input: {},
+      callerCapabilities: ["gate:approve"]
+    };
+
+    flow.decisionError = new Error("flow unavailable");
+    await expect(core.decideHumanGate(gate.id, input)).rejects.toMatchObject({
+      code: "INTEGRATION_ERROR",
+      details: { retryable: true }
+    });
+    expect(core.getTask(task.id).status).toBe("awaiting_human");
+    expect(store.getHumanGate(gate.id).status).toBe("decision_failed");
+    expect(store.getHumanDecision(gate.id)).toMatchObject({
+      deliveryStatus: "failed",
+      lastError: "flow unavailable"
+    });
+
+    flow.decisionError = undefined;
+    const retried = await core.decideHumanGate(gate.id, input);
+    expect(retried.status).toBe("approved");
+    expect(flow.decisions).toHaveLength(2);
+    expect(core.getTask(task.id).status).toBe("running");
   });
 
   it("enforces workflow and repository constraints", async () => {

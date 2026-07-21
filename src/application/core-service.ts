@@ -504,7 +504,7 @@ export class CoreService {
     const input = DecideHumanGateInputSchema.parse(raw);
     const required = input.decision === "approve" ? "gate:approve" : "gate:reject";
     this.requireCapability(input.callerCapabilities, required);
-    const gate = this.store.getHumanGate(gateId);
+    let gate = this.store.getHumanGate(gateId);
     if (gate.allowedApprovers.length > 0 && !gate.allowedApprovers.some((actor) => actor.type === input.actor.type && actor.id === input.actor.id)) {
       throw new ForbiddenError("Actor is not an allowed approver for this gate", {
         gateId,
@@ -512,47 +512,57 @@ export class CoreService {
       });
     }
     const target = input.decision === "approve" ? "approved" : "rejected";
-    assertGateTransition(gate.status, target);
     const now = this.clock.now();
-    const updatedGate: HumanGate = { ...gate, status: target, updatedAt: now };
-    const decision: HumanDecision = {
-      id: this.ids.next("decision"),
-      gateId,
-      actor: input.actor,
-      decision: input.decision,
-      ...(input.comment !== undefined ? { comment: input.comment } : {}),
-      input: input.input,
-      createdAt: now
-    };
-    this.store.transaction(() => {
-      this.store.updateHumanGate(updatedGate);
-      this.store.insertHumanDecision(decision);
-      const bundle = this.store.getEvidenceBundleByRun(gate.flowRunId);
-      this.store.insertEvidenceItem({
-        id: this.ids.next("item"),
-        bundleId: bundle.id,
-        kind: "human-decision",
-        name: `${gate.jobId}.${gate.stepId}:${input.decision}`,
-        uri: `zigma://human-gates/${gate.id}/decisions/${decision.id}`,
-        summary: input.comment ?? `Human gate ${input.decision}`,
-        metadata: { actor: input.actor, input: input.input },
-        createdAt: now
+    let decision = this.store.getHumanDecision(gateId);
+    if (decision) {
+      const sameRequest = decision.actor.type === input.actor.type
+        && decision.actor.id === input.actor.id
+        && decision.decision === input.decision
+        && (decision.comment ?? undefined) === (input.comment ?? undefined)
+        && stableHash(decision.input) === stableHash(input.input);
+      if (!sameRequest || !["decision_pending", "decision_failed"].includes(gate.status)) {
+        throw new ConflictError("Human gate already has a different or completed decision", { gateId, status: gate.status });
+      }
+      assertGateTransition(gate.status, "decision_pending");
+      decision = { ...decision, deliveryStatus: "pending", lastError: undefined, updatedAt: now };
+      gate = { ...gate, status: "decision_pending", updatedAt: now };
+      this.store.transaction(() => {
+        this.store.updateHumanDecisionDelivery(decision!);
+        this.store.updateHumanGate(gate);
       });
-      this.audit("human-gate", gate.id, `human-gate.${target}`, input.actor, {
-        decisionId: decision.id,
-        comment: input.comment,
-        input: input.input
-      }, gate.taskId);
-    });
+    } else {
+      assertGateTransition(gate.status, "decision_pending");
+      decision = {
+        id: this.ids.next("decision"),
+        gateId,
+        actor: input.actor,
+        decision: input.decision,
+        ...(input.comment !== undefined ? { comment: input.comment } : {}),
+        input: input.input,
+        deliveryStatus: "pending",
+        createdAt: now,
+        updatedAt: now
+      };
+      gate = { ...gate, status: "decision_pending", updatedAt: now };
+      this.store.transaction(() => {
+        this.store.insertHumanDecision(decision!);
+        this.store.updateHumanGate(gate);
+        this.audit("human-gate", gate.id, "human-gate.decision-pending", input.actor, {
+          decisionId: decision!.id,
+          decision: input.decision
+        }, gate.taskId);
+      });
+    }
 
     const run = this.store.getFlowRun(gate.flowRunId);
     if (!run.externalRunId) {
-      throw new IntegrationError("Cannot resume gate because the flow run has no externalRunId", {
-        flowRunId: run.id
-      });
+      return this.failHumanGateDelivery(gate, decision, "Flow run has no externalRunId");
     }
     const workspace = run.workspaceId ? this.store.getWorkspace(run.workspaceId) : undefined;
-    if (this.flowExecutor.decideGate) {
+    try {
+      if (!this.flowExecutor.decideGate) {
+        throw new Error("Flow executor does not support human gate decisions");
+      }
       const profile = this.store.getExecutionProfile(run.executionProfileId);
       await this.flowExecutor.decideGate({
         command: profile.flowCommand,
@@ -565,16 +575,62 @@ export class CoreService {
         timeoutMs: profile.timeoutMs,
         environment: profile.environment
       });
+    } catch (error) {
+      return this.failHumanGateDelivery(gate, decision, error instanceof Error ? error.message : String(error));
     }
-    const refreshedRun = this.store.getFlowRun(gate.flowRunId);
-    if (refreshedRun.status === "awaiting_human") {
-      this.store.updateFlowRun({ ...refreshedRun, status: "running", updatedAt: this.clock.now() });
-    }
-    const task = this.store.getTask(gate.taskId);
-    if (task.status === "awaiting_human") {
-      this.transitionTask(task, input.decision === "approve" ? "running" : "blocked", input.actor);
-    }
+
+    const deliveredAt = this.clock.now();
+    const deliveredDecision: HumanDecision = { ...decision, deliveryStatus: "delivered", lastError: undefined, updatedAt: deliveredAt };
+    const completedGate: HumanGate = { ...gate, status: target, updatedAt: deliveredAt };
+    this.store.transaction(() => {
+      this.store.updateHumanDecisionDelivery(deliveredDecision);
+      this.store.updateHumanGate(completedGate);
+      const bundle = this.store.getEvidenceBundleByRun(gate.flowRunId);
+      this.store.insertEvidenceItem({
+        id: this.ids.next("item"),
+        bundleId: bundle.id,
+        kind: "human-decision",
+        name: `${gate.jobId}.${gate.stepId}:${input.decision}`,
+        uri: `zigma://human-gates/${gate.id}/decisions/${decision.id}`,
+        summary: input.comment ?? `Human gate ${input.decision}`,
+        metadata: { actor: input.actor, input: input.input },
+        createdAt: deliveredAt
+      });
+      this.audit("human-gate", gate.id, `human-gate.${target}`, input.actor, {
+        decisionId: decision.id,
+        comment: input.comment,
+        input: input.input
+      }, gate.taskId);
+      const refreshedRun = this.store.getFlowRun(gate.flowRunId);
+      if (refreshedRun.status === "awaiting_human") {
+        this.store.updateFlowRun({ ...refreshedRun, status: "running", updatedAt: deliveredAt });
+      }
+      const task = this.store.getTask(gate.taskId);
+      if (task.status === "awaiting_human") {
+        this.transitionTask(task, input.decision === "approve" ? "running" : "blocked", input.actor);
+      }
+    });
     return this.store.getHumanGate(gateId);
+  }
+
+  private failHumanGateDelivery(gate: HumanGate, decision: HumanDecision, message: string): never {
+    const failedAt = this.clock.now();
+    const failedDecision: HumanDecision = { ...decision, deliveryStatus: "failed", lastError: message, updatedAt: failedAt };
+    const failedGate: HumanGate = { ...gate, status: "decision_failed", updatedAt: failedAt };
+    this.store.transaction(() => {
+      this.store.updateHumanDecisionDelivery(failedDecision);
+      this.store.updateHumanGate(failedGate);
+      this.audit("human-gate", gate.id, "human-gate.decision-delivery-failed", decision.actor, {
+        decisionId: decision.id,
+        error: message
+      }, gate.taskId);
+    });
+    throw new IntegrationError("Failed to deliver human gate decision", {
+      gateId: gate.id,
+      decisionId: decision.id,
+      retryable: true,
+      cause: message
+    });
   }
 
   addEvidenceItem(flowRunId: string, raw: AddEvidenceItemInput): EvidenceItem {

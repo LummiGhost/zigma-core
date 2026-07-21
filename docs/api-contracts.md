@@ -217,6 +217,8 @@ Event types:
 }
 ```
 
+The endpoint may return `502 INTEGRATION_ERROR` with `details.retryable: true` when the decision is persisted but delivery to `zigma-flow` fails. The gate remains `decision_failed`; resubmitting the identical request retries delivery. A different decision or actor returns `409 CONFLICT`.
+
 ## Evidence
 
 ### `POST /flow-runs/:id/evidence`

@@ -195,7 +195,10 @@ export class SqliteStore {
         decision TEXT NOT NULL,
         comment TEXT,
         input_json TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        delivery_status TEXT NOT NULL DEFAULT 'pending',
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS evidence_bundles (
@@ -241,9 +244,21 @@ export class SqliteStore {
       CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_flow_runs_task ON flow_runs(task_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_gates_status ON human_gates(status, created_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_human_decisions_gate ON human_decisions(gate_id);
       CREATE INDEX IF NOT EXISTS idx_evidence_items_bundle ON evidence_items(bundle_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_audit_aggregate ON audit_events(aggregate_type, aggregate_id, created_at);
     `);
+    const decisionColumns = this.db.prepare("PRAGMA table_info(human_decisions)").all() as Array<{ name: string }>;
+    if (!decisionColumns.some((column) => column.name === "delivery_status")) {
+      this.db.exec("ALTER TABLE human_decisions ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'delivered'");
+    }
+    if (!decisionColumns.some((column) => column.name === "last_error")) {
+      this.db.exec("ALTER TABLE human_decisions ADD COLUMN last_error TEXT");
+    }
+    if (!decisionColumns.some((column) => column.name === "updated_at")) {
+      this.db.exec("ALTER TABLE human_decisions ADD COLUMN updated_at TEXT");
+      this.db.exec("UPDATE human_decisions SET updated_at = created_at WHERE updated_at IS NULL");
+    }
   }
 
   insertExecutionProfile(profile: ExecutionProfile): void {
@@ -643,28 +658,56 @@ export class SqliteStore {
   }
 
   insertHumanDecision(decision: HumanDecision): void {
-    this.db.prepare(`INSERT INTO human_decisions (id, gate_id, actor_json, decision, comment, input_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+    this.db.prepare(`INSERT INTO human_decisions (
+      id, gate_id, actor_json, decision, comment, input_json, delivery_status,
+      last_error, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       decision.id,
       decision.gateId,
       toJson(decision.actor),
       decision.decision,
       decision.comment ?? null,
       toJson(decision.input),
-      decision.createdAt
+      decision.deliveryStatus,
+      decision.lastError ?? null,
+      decision.createdAt,
+      decision.updatedAt
     );
   }
 
-  listHumanDecisions(gateId: string): HumanDecision[] {
-    const rows = this.db.prepare("SELECT * FROM human_decisions WHERE gate_id = ? ORDER BY created_at ASC").all(gateId) as Record<string, unknown>[];
-    return rows.map((row) => ({
+  getHumanDecision(gateId: string): HumanDecision | undefined {
+    const row = this.db.prepare("SELECT * FROM human_decisions WHERE gate_id = ?").get(gateId) as Record<string, unknown> | undefined;
+    return row ? this.humanDecisionFromRow(row) : undefined;
+  }
+
+  updateHumanDecisionDelivery(decision: HumanDecision): void {
+    this.db.prepare(`UPDATE human_decisions
+      SET delivery_status = ?, last_error = ?, updated_at = ? WHERE id = ?`).run(
+      decision.deliveryStatus,
+      decision.lastError ?? null,
+      decision.updatedAt,
+      decision.id
+    );
+  }
+
+  private humanDecisionFromRow(row: Record<string, unknown>): HumanDecision {
+    return {
       id: String(row["id"]),
       gateId: String(row["gate_id"]),
       actor: fromJson(row["actor_json"], { type: "system", id: "unknown" }),
       decision: row["decision"] as HumanDecision["decision"],
       ...(optionalString(row["comment"]) ? { comment: optionalString(row["comment"]) } : {}),
       input: fromJson(row["input_json"], {}),
-      createdAt: String(row["created_at"])
-    }));
+      deliveryStatus: String(row["delivery_status"]) as HumanDecision["deliveryStatus"],
+      ...(optionalString(row["last_error"]) ? { lastError: optionalString(row["last_error"]) } : {}),
+      createdAt: String(row["created_at"]),
+      updatedAt: optionalString(row["updated_at"]) ?? String(row["created_at"])
+    };
+  }
+
+  listHumanDecisions(gateId: string): HumanDecision[] {
+    const rows = this.db.prepare("SELECT * FROM human_decisions WHERE gate_id = ? ORDER BY created_at ASC").all(gateId) as Record<string, unknown>[];
+    return rows.map((row) => this.humanDecisionFromRow(row));
   }
 
   insertEvidenceBundle(bundle: EvidenceBundle): void {

@@ -71,7 +71,7 @@ Flow Run mirrors a `zigma-flow` run at platform level. Core stores a status proj
 
 ### Human Gate aggregate
 
-Human Gate mirrors a human step raised by a Flow Run. Decisions are immutable child records. A gate accepts at most one terminal decision.
+Human Gate mirrors a human step raised by a Flow Run. Decisions are immutable child records. A gate accepts at most one terminal decision. Delivery uses `decision_pending` and `decision_failed` intermediate states: Core only marks a gate `approved` or `rejected` after `zigma-flow` accepts the decision, and the same decision can be retried after a delivery failure.
 
 ### Evidence Bundle aggregate
 
@@ -95,7 +95,7 @@ This sequence preserves enough state to diagnose partial failures. Future asynch
 
 Flow callback events use a globally unique `eventId`. The SQLite adapter stores events with `INSERT OR IGNORE`, making repeated callback delivery safe.
 
-Human Gates use a unique `(flow_run_id, external_gate_id)` key.
+Human Gates use a unique `(flow_run_id, external_gate_id)` key, and decisions use a unique `gate_id` key so retries reuse the persisted decision instead of creating duplicates.
 
 Project keys and execution profile names are unique.
 
@@ -137,6 +137,8 @@ The MVP supports a single Core process with a local SQLite database. WAL mode pe
 The intended platform evolution is:
 
 1. Local Core process and SQLite
+
+The baseline runtime is Node.js 22 with the built-in `node:sqlite` driver. A `better-sqlite3` implementation may be added later as an optional adapter; it is deliberately not required by or bundled with the MVP.
 2. Persistent Core service and PostgreSQL
 3. Asynchronous execution host protocol
 4. Multi-tenant organization and policy service
