@@ -1,0 +1,9 @@
+{
+  "name": "local-cli",
+  "mode": "local-cli",
+  "flowCommand": "zigma-flow",
+  "workspaceCommand": "zigma-workspace",
+  "timeoutMs": 3600000,
+  "environment": {},
+  "metadata": {}
+}

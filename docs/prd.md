@@ -1,470 +1,667 @@
 # Zigma Core PRD
 
-文档版本：v0.2
+文档版本：v0.3
 
-状态：草案
+状态：MVP 实现候选
 
-日期：2026-07-14
+日期：2026-07-20
 
 仓库：`zigma-core`
 
-## 1. 项目定位
+## 1. 组件定义
 
-Zigma Core 是 Zigma 平台的控制面组件，负责项目、任务、权限、审批、证据汇总和平台级状态管理。它将用户请求转化为可执行的 `zigma-flow` run，并把 `zigma-flow`、`zigma-workspace`、外部 Git/GitHub CLI、未来的 `zigma-code` 组织为一个可审计的开发任务生命周期。
+Zigma Core 是 Zigma 平台的控制面组件。它负责把外部请求组织为长期存在、权限受控、状态可恢复、过程可审计的任务，并协调 `zigma-flow`、`zigma-workspace`、未来 `zigma-code` 与其他平台服务。
 
-Zigma Core 对应早期设计中的 `zigma-host`。当前版本明确移除 `zigma-runner` 作为独立组件：Core 不再通过 Runner 间接执行任务，而是通过本地进程、服务进程或未来 execution host 直接启动 `zigma-flow`。`git`、`gh`、`pnpm`、`zigma-workspace`、未来 `zigma-code` 等命令由 `zigma-flow` 的 `script` / `check` step 调用并纳入 artifact/evidence 体系。
+Core 管理平台级事实：项目、任务、权限快照、Flow Run 引用、Workspace 引用、Human Gate、Evidence Bundle 和审计事件。
 
-一句话定义：
+`zigma-flow` 继续管理 Workflow、Job、Step、Signal、Artifact 和 Engine 状态。`zigma-workspace` 继续管理 Git worktree、缓存、锁、快照与清理。Core 仅保存这些组件产生的稳定引用和状态投影。
 
-Zigma Core 是 Zigma 的平台控制面，负责把外部请求转化为有权限快照、有工作区、有 flow run、有审批记录、有交付证据的 Agent 开发任务。
+## 2. 设计目标
 
-## 2. 背景
+1. 建立稳定的 Zigma 平台领域模型和 API 契约。
+2. 让一次 Task 可以关联多个执行尝试、Workspace、Flow Run、Human Gate 与证据项。
+3. 在执行开始时生成不可变 Permission Snapshot，防止运行过程中的权限漂移。
+4. 将外部组件隔离在 Port 和 Adapter 后方，允许 CLI、Library API、Service API 和远程 Host 并存。
+5. 维护严格的平台状态机，避免 Core 与 Flow 同时控制同一层状态。
+6. 建立 Evidence Bundle，将执行结果、验证、代码差异、审批和外部链接组织为可审计交付物。
+7. 为 WebUI、Mail、Skill Registry、Code 平台与企业权限系统提供统一控制面。
 
-`zigma-flow` 已经演进为本地 Agent Workflow Runtime，负责 Workflow、Job、Step、Artifact、Signal、Gate 和 Engine 状态推进。它适合治理单次 Agent workflow run，但不应承担长期项目状态、组织权限、任务入口、项目配置和平台级 evidence 管理。
+## 3. 设计原则
 
-此前设计中曾规划 `zigma-runner` 作为执行节点，但其职责与 `zigma-flow` 的 workflow 编排能力、`zigma-workspace` 的工作区能力、以及 Git/GitHub CLI 步骤存在重叠。类比 GitHub Actions，Runner 应只是通用 job 执行器，而当前 Zigma 尚未形成独立的通用 job package 协议，因此暂时剔除 `zigma-runner` 可以降低系统复杂度。
+### 3.1 Contract First
 
-新的 MVP 思路是：
+`src/contracts` 是公开契约源。类型、Zod Schema、HTTP DTO 和组件 Port 应保持一致。其他组件可以调整内部实现，只要满足契约。
 
-1. Core 管理 Task、Project、Permission Snapshot、Human Gate 和 Evidence Bundle。
-2. Core 选择并启动 `zigma-flow` workflow。
-3. Workspace 准备可以由 Core 调用 `zigma-workspace` CLI/API，也可以由 `zigma-flow` script step 显式调用。
-4. Git、GitHub、CI、PR 等短期能力由 `zigma-flow` script/check step 直接调用 `git`、`gh` 等 CLI。
-5. 平台化阶段再由 `zigma-code` 提供自有代码协作平台能力。
+### 3.2 Aggregate Ownership
 
-## 3. 目标
+每类状态只能有一个所有者。Core 管理 Task 状态，Flow 管理 Job 和 Step 状态，Workspace 管理工作目录状态。
 
-核心目标包括：
+### 3.3 Immutable Authorization
 
-1. 建立 Zigma 平台级任务模型，使一次开发请求可以关联 Project、Workspace、Flow Run、Human Gate、Evidence Bundle、Issue/PR 链接和审计记录。
-2. 管理项目配置，包括默认仓库、默认 workflow、workspace policy、Skill Pack profile、execution profile、代码平台策略。
-3. 管理组织级权限和 run 级权限快照，将用户能力、项目范围和代码操作边界传递给 `zigma-flow`。
-4. 直接启动或恢复 `zigma-flow` run，而不是通过独立 Runner 组件。
-5. 支持通过 `zigma-flow` script/check step 调用 `git`、`gh`、`zigma-workspace` CLI、未来 `zigma-code` CLI/API。
-6. 接收 human gate 决策，将 Web、邮件、CLI、Issue 评论等外部审批动作转化为 `zigma-flow` 可处理的 decision。
-7. 汇总 flow evidence，将 event、artifact、validation、diff、PR、CI、human decision 组织成平台级 Evidence Bundle。
-8. 为后续 Web Console、邮件网关、Skill Registry、Zigma Code 和企业部署提供控制面。
+每次执行尝试创建新的 Permission Snapshot。已有快照不会原地修改。
 
-## 4. 非目标范围
+### 3.4 Evidence by Reference
 
-Zigma Core 不承担以下职责：
+Core 保存 URI、摘要、摘要哈希和元数据。大型 Artifact 内容由产生组件或对象存储保存。
 
-1. 不实现 `zigma-flow` 内部 workflow engine，不解释 flow job/step DAG，不修改 flow state。
-2. 不直接生成 Agent prompt；prompt 生成属于 `zigma-flow`。
-3. 不直接实现代码修改、测试、构建、PR 创建等开发动作；这些应由 `zigma-flow` workflow 的 script/check/agent step 显式执行。
-4. 不直接管理底层 Git worktree、依赖缓存、snapshot 和清理细节；这些属于 `zigma-workspace`，MVP 中也可由 flow script 调用 `git` / `zigma-workspace` CLI 完成。
-5. 不实现代码托管、Issue、PR、Review 平台；这些属于未来 `zigma-code`。
-6. 不在 MVP 中实现独立 Runner、分布式 worker pool 或通用 job package 协议。
-7. 不在 MVP 中实现完整 Web UI、邮件系统或多租户计费系统。
+### 3.5 Idempotent Integration
 
-## 5. 用户与使用者
+外部事件采用稳定 Event ID。重复事件不会重复推进状态。
 
-第一类使用者是项目维护者。他们希望用 Zigma 管理 DataCat 等复杂项目的持续开发，要求任务可审计、可回放、可审批。
+### 3.6 Replaceable Adapters
 
-第二类使用者是平台管理员。他们配置项目、权限、仓库、workflow、workspace 策略、execution profile 和代码平台策略。
+MVP 提供本地 CLI Adapter。后续可加入 Library Adapter、HTTP Adapter 和 Remote Host Adapter，应用层无需改写。
 
-第三类使用者是 Agent workflow 设计者。他们为不同项目绑定不同 `zigma-flow` workflow、Skill Pack、human gate 和验收策略。
+## 4. 范围
 
-第四类使用者是外部请求者。他们可以通过未来 Web、邮件、Issue 评论或 API 提交任务，但不直接接触底层 flow run。
+### 4.1 MVP 范围
 
-## 6. 核心概念
+- Execution Profile
+- Project 与 Repository Binding
+- Task 生命周期
+- Permission Snapshot
+- Workspace Ref
+- Flow Run Ref
+- Human Gate 与 Human Decision
+- Evidence Bundle 与 Evidence Item
+- Audit Event
+- SQLite 持久化
+- HTTP API
+- 管理 CLI
+- `zigma-flow` CLI Adapter
+- `zigma-workspace` CLI Adapter
+- 单元测试和 API 测试
 
-### 6.1 Project
+### 4.2 后续范围
 
-Project 是 Zigma 内的长期项目单元。DataCat、Zigma Flow、df-lfs 都可以是 Project。
+- Organization、Team、Membership 与 Service Account
+- RBAC、ABAC 和策略语言
+- 异步 Outbox 与执行 Host
+- PostgreSQL
+- WebUI
+- Mail 入口
+- Skill Registry
+- `zigma-code`
+- 多租户配额与计费
+- 高可用部署
+
+### 4.3 排除范围
+
+- Workflow DAG 解释
+- Agent Prompt 生成
+- Job 和 Step 状态推进
+- Git worktree 细节
+- 代码修改、构建和测试动作
+- 自有 Git 托管、Issue、PR 与 CI
+- 大型 Artifact 二进制存储
+
+## 5. 领域模型
+
+## 5.1 ActorRef
+
+ActorRef 表示触发或批准平台操作的主体。
+
+```ts
+interface ActorRef {
+  type: "user" | "agent" | "service" | "system";
+  id: string;
+  displayName?: string;
+  provider?: string;
+  externalId?: string;
+}
+```
+
+规则：
+
+- `type + id` 构成 Core 内的主体引用。
+- `provider + externalId` 保存外部身份映射。
+- ActorRef 是快照，不要求外部身份记录永久存在。
+
+## 5.2 TaskSource
+
+TaskSource 描述任务入口与外部关联。
+
+```ts
+interface TaskSource {
+  kind: "api" | "web" | "mail" | "code-platform" | "schedule" | "cli" | "system";
+  provider?: string;
+  externalId?: string;
+  url?: string;
+  metadata: Record<string, unknown>;
+}
+```
+
+Task Source 影响审计和回复路由，不直接授予权限。
+
+## 5.3 ExecutionProfile
+
+Execution Profile 描述 Core 如何调用执行组件。
+
+```ts
+interface ExecutionProfile {
+  id: string;
+  name: string;
+  mode: "local-cli" | "local-service" | "remote-host";
+  flowCommand: string;
+  workspaceCommand: string;
+  timeoutMs: number;
+  environment: Record<string, string>;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+```
+
+MVP 实现 `local-cli`。其余模式保留为契约扩展点。
+
+## 5.4 RepositoryBinding
+
+Repository Binding 描述 Project 可使用的代码仓库。
+
+```ts
+interface RepositoryBinding {
+  id: string;
+  provider: "github" | "gitlab" | "gitea" | "generic-git";
+  url: string;
+  defaultRef: string;
+  writable: boolean;
+  metadata: Record<string, unknown>;
+}
+```
+
+`id` 是 Project 内稳定标识。URL 可以迁移，权限快照引用 `id`。
+
+## 5.5 WorkspacePolicy
+
+```ts
+interface WorkspacePolicy {
+  provider: "zigma-workspace-cli" | "existing-directory" | "none";
+  mode: "writable" | "read-only";
+  branchTemplate: string;
+  cleanup: "always" | "on-success" | "manual";
+  snapshotOnTerminal: boolean;
+}
+```
+
+Branch Template 支持 `{taskId}` 与 `{projectKey}`。
+
+## 5.6 Project
+
+Project 是长期配置聚合。
 
 ```ts
 interface Project {
   id: string;
-  name: string;
+  key: string;
+  displayName: string;
   description?: string;
-  defaultRepositoryId?: string;
-  defaultFlowWorkflowId?: string;
-  workspacePolicyId?: string;
-  skillProfileId?: string;
-  codePlatformProfileId?: string;
-  executionProfileId?: string;
+  status: "active" | "archived";
+  repositories: RepositoryBinding[];
+  defaultRepositoryId: string;
+  defaultWorkflowRef: string;
+  executionProfileId: string;
+  workspacePolicy: WorkspacePolicy;
+  skillProfileRef?: string;
+  metadata: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
+  archivedAt?: string;
 }
 ```
 
-### 6.2 Task
+约束：
 
-Task 是 Zigma 平台级任务。它可以来自 Web、邮件、Issue、PR 评论、定时任务或人工创建。
+- `key` 全局唯一。
+- `defaultRepositoryId` 必须指向嵌入的 Repository Binding。
+- archived Project 不接受新 Task。
+- Project 更新不会改变已有 Permission Snapshot 与 Flow Run。
 
-Task 不等同于 GitHub Issue，也不等同于 `zigma-flow` run。一个 Task 可以关联多个 flow run、多个 workspace、一个或多个 PR、多个 human decisions。
+## 5.7 Task
+
+Task 是平台级工作单元。
 
 ```ts
-interface ZigmaTask {
+interface Task {
   id: string;
   projectId: string;
   title: string;
   description: string;
+  priority: "low" | "normal" | "high" | "urgent";
   source: TaskSource;
-  status: TaskStatus;
-  priority?: "low" | "normal" | "high" | "urgent";
   createdBy: ActorRef;
-  currentFlowRunId?: string;
+  status: TaskStatus;
+  labels: string[];
+  metadata: Record<string, unknown>;
+  activeFlowRunId?: string;
+  revision: number;
+  failure?: TaskFailure;
   createdAt: string;
   updatedAt: string;
-}
-```
-
-### 6.3 Flow Execution Profile
-
-Execution Profile 描述 Core 如何启动 `zigma-flow`。MVP 可使用本地 CLI，平台化后可切换为服务 API 或远程执行主机，但不引入独立 `zigma-runner` 组件。
-
-```ts
-interface FlowExecutionProfile {
-  id: string;
-  mode: "local-cli" | "local-service" | "remote-host";
-  zigmaFlowCommand?: string;
-  workingDirectoryPolicy: "project-root" | "workspace-root" | "control-directory";
-  envPolicyId?: string;
-  allowedTools: string[];
-  timeoutSeconds?: number;
-}
-```
-
-### 6.4 Flow Run Ref
-
-Flow Run Ref 是 Core 对 `zigma-flow` run 的平台级引用。Core 不读取或修改 flow 内部状态机字段，只保存引用、摘要和状态镜像。
-
-```ts
-interface FlowRunRef {
-  id: string;
-  taskId: string;
-  projectId: string;
-  workspaceId?: string;
-  workflowId: string;
-  zigmaFlowRunId: string;
-  executionProfileId: string;
-  status: "queued" | "running" | "awaiting_human" | "completed" | "failed" | "cancelled";
-  evidenceBundleId?: string;
-  startedAt?: string;
   completedAt?: string;
 }
 ```
 
-### 6.5 Caller Context
+Task 与 Issue、PR、Flow Run 彼此独立。一个 Task 可以有多个 Flow Run 尝试。
 
-Caller Context 是 Core 下发给 `zigma-flow` 的权限与来源快照。
+TaskStatus：
+
+```text
+created
+queued
+provisioning
+running
+awaiting_human
+blocked
+completed
+failed
+cancelled
+```
+
+状态迁移：
+
+```text
+created -> queued -> provisioning -> running -> completed
+   |          |             |          |-> awaiting_human -> running
+   |          |             |          |-> blocked -> running
+   |          |             |          |-> failed
+   |          |             |          |-> cancelled
+   |          |             |-> failed
+   |          |-> failed
+   |-> cancelled
+
+failed -> queued
+blocked -> queued | running
+```
+
+`revision` 在每次状态更新时递增，SQLite 更新必须匹配旧 revision。
+
+## 5.8 PermissionSnapshot
 
 ```ts
-interface CallerContext {
+interface PermissionSnapshot {
+  id: string;
+  taskId: string;
   actor: ActorRef;
-  source: TaskSource;
-  projectScope: {
-    projectId: string;
+  capabilities: Capability[];
+  constraints: {
     repositoryIds: string[];
+    workflowRefs: string[];
+    toolNames: string[];
+    branchPatterns: string[];
+    maxRunDurationMs?: number;
+    expiresAt?: string;
   };
-  permissions: {
-    canReadCode: boolean;
-    canWriteCode: boolean;
-    canCreateBranch: boolean;
-    canCreatePullRequest: boolean;
-    canApproveHumanGate: boolean;
-    canMergePullRequest: boolean;
-    allowedWorkflows: string[];
-    allowedTools: string[];
-  };
+  source: TaskSource;
+  hash: string;
+  createdAt: string;
   expiresAt?: string;
 }
 ```
 
-### 6.6 Human Gate
+Capability 命名采用 `resource:action`：
 
-Human Gate 是 `zigma-flow` human step 在 Core 层的远程审批镜像。Core 负责把审批请求暴露给外部入口，并把审批结果回传给 `zigma-flow`。
+- `task:start`
+- `task:cancel`
+- `workflow:invoke`
+- `workspace:create`
+- `workspace:write`
+- `gate:approve`
+- `gate:reject`
+- `evidence:write`
+- `code:read`
+- `code:write`
+- `code:pull-request:create`
+- `code:pull-request:merge`
+
+MVP 在 Core 层校验任务、Workflow、Repository、Workspace 与 Gate 能力。工具与分支约束通过契约传递给执行侧。
+
+## 5.9 WorkspaceRef
 
 ```ts
-interface HumanGateRequest {
+interface WorkspaceRef {
   id: string;
+  taskId: string;
+  flowRunId: string;
+  provider: string;
+  externalId: string;
+  path: string;
+  repositoryUrl: string;
+  baseRef: string;
+  baseCommit: string;
+  branch: string;
+  mode: "writable" | "read-only";
+  status: "preparing" | "ready" | "active" | "released" | "failed";
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+  releasedAt?: string;
+}
+```
+
+Core 不扫描工作目录。Diff 与 Snapshot 通过 Workspace Provider 获取并写入 Evidence Bundle。
+
+## 5.10 FlowRun
+
+```ts
+interface FlowRun {
+  id: string;
+  taskId: string;
+  workflowRef: string;
+  executionProfileId: string;
+  permissionSnapshotId: string;
+  workspaceId?: string;
+  externalRunId?: string;
+  status: FlowRunStatus;
+  attempt: number;
+  inputs: Record<string, string>;
+  context: Record<string, unknown>;
+  exitCode?: number;
+  error?: TaskFailure;
+  startedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+```
+
+FlowRunStatus：
+
+```text
+created -> starting -> running -> completed
+                    |        |-> awaiting_human -> running
+                    |        |-> failed
+                    |        |-> cancelled
+                    |-> completed
+                    |-> failed
+                    |-> cancelled
+```
+
+`externalRunId` 由 `zigma-flow` 生成。Core 内部先创建 `FlowRun.id`，使 Workspace、权限快照和回调在外部 Run ID 产生前即可建立关联。
+
+## 5.11 HumanGate
+
+```ts
+interface HumanGate {
+  id: string;
+  externalGateId: string;
   taskId: string;
   flowRunId: string;
   jobId: string;
   stepId: string;
   prompt: string;
+  inputSchema: Record<string, unknown>;
   allowedApprovers: ActorRef[];
-  status: "awaiting" | "approved" | "rejected" | "expired";
+  status: "awaiting" | "approved" | "rejected" | "expired" | "cancelled";
+  dueAt?: string;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
 }
 ```
 
-### 6.7 Evidence Bundle
+同一 Flow Run 内 `externalGateId` 唯一。Gate 进入终态后不可重新决定。
 
-Evidence Bundle 是一次任务的可审计证据包。
+## 5.12 HumanDecision
+
+```ts
+interface HumanDecision {
+  id: string;
+  gateId: string;
+  actor: ActorRef;
+  decision: "approve" | "reject";
+  comment?: string;
+  input: Record<string, unknown>;
+  createdAt: string;
+}
+```
+
+Decision 是不可变审计记录，同时生成 `human-decision` Evidence Item。
+
+## 5.13 EvidenceBundle
 
 ```ts
 interface EvidenceBundle {
   id: string;
   taskId: string;
   flowRunId: string;
-  summary: string;
-  flowArtifacts: ArtifactRef[];
-  validationEvidence: ValidationEvidence[];
-  codeChanges: CodeChangeSummary[];
-  externalLinks: ExternalLink[];
-  humanDecisions: HumanDecision[];
+  status: "open" | "finalized";
+  summary?: string;
   risks: string[];
+  conclusions: string[];
+  createdAt: string;
+  updatedAt: string;
+  finalizedAt?: string;
+}
+```
+
+每个 Flow Run 创建一个 Bundle。Finalized Bundle 不接受新增 Item。
+
+## 5.14 EvidenceItem
+
+```ts
+interface EvidenceItem {
+  id: string;
+  bundleId: string;
+  kind:
+    | "flow-artifact"
+    | "flow-event-log"
+    | "validation"
+    | "workspace-diff"
+    | "workspace-snapshot"
+    | "code-change"
+    | "pull-request"
+    | "ci-result"
+    | "human-decision"
+    | "summary"
+    | "external-link"
+    | "other";
+  name: string;
+  uri: string;
+  mediaType?: string;
+  digest?: string;
+  sizeBytes?: number;
+  summary?: string;
+  metadata: Record<string, unknown>;
   createdAt: string;
 }
 ```
 
-## 7. 功能需求
+URI 支持 `file:`、`https:`、未来对象存储 URI 和 Zigma 内部 URI。
 
-### FR-001 项目注册与配置
-
-Core 必须支持创建、读取、更新和归档 Project。Project 应能绑定默认仓库、默认 `zigma-flow` workflow、workspace policy、Skill Profile、Execution Profile 和代码平台配置。
-
-### FR-002 任务创建
-
-Core 必须支持创建 Task。Task 来源包括手动 API、未来 Web Console、邮件、代码平台事件和定时任务。
-
-### FR-003 任务状态机
-
-Task 状态至少包括：
-
-```text
-created -> queued -> running -> awaiting_human -> completed
-                              -> failed
-                              -> cancelled
-                              -> blocked
-```
-
-Task 状态由 Core 管理，flow 内部 job/step 状态由 `zigma-flow` 管理。
-
-### FR-004 Flow Run 启动
-
-Core 必须能根据 Project、Task、Caller Context、Execution Profile 和 Workspace Policy 启动 `zigma-flow` run。
+## 5.15 AuditEvent
 
 ```ts
-interface StartFlowRunRequest {
-  taskId: string;
-  projectId: string;
-  workflowId: string;
-  taskText: string;
-  workspaceId?: string;
-  callerContext: CallerContext;
-  inputs: Record<string, unknown>;
+interface AuditEvent {
+  id: string;
+  aggregateType: string;
+  aggregateId: string;
+  action: string;
+  actor: ActorRef;
+  payload: Record<string, unknown>;
+  correlationId?: string;
+  causationId?: string;
+  createdAt: string;
 }
 ```
 
-MVP 可通过 CLI 启动：
+Audit Event 采用追加写入。`correlationId` 通常使用 Task ID，`causationId` 可引用外部 Event ID。
 
-```bash
-zigma-flow run-all <workflow> --task-file <task.md>
-```
+## 6. 应用服务
 
-后续可切换为 library API、service API 或远程 execution host，但不恢复 `zigma-runner` 作为默认独立组件。
-
-### FR-005 Workspace 协调
-
-Core 应支持两种 workspace 协调方式：
-
-1. Core 先调用 `zigma-workspace` CLI/API 创建 workspace，再在该 workspace 中启动 `zigma-flow`。
-2. Core 启动一个 control workflow，由 `zigma-flow` script step 显式调用 `zigma-workspace create`、`git worktree`、`git diff` 等命令。
-
-两种方式都必须把 workspace id/path/base commit/branch 写入 flow inputs 或 context block，供后续 step 使用。
-
-### FR-006 CLI Tool 权限策略
-
-Core 必须能为一次 flow run 生成 allowed tools 策略，例如允许或禁止：
-
-```text
-git
-gh
-pnpm
-npm
-docker
-zigma-workspace
-zigma-code
-```
-
-实际命令执行仍由 `zigma-flow` script/check step 完成，但 Core 负责生成权限快照和审计记录。
-
-### FR-007 状态同步
-
-Core 必须接收 flow run 状态、human gate waiting event、completion summary、artifact index 和 validation evidence，并更新 FlowRunRef 与 Task 状态镜像。
-
-### FR-008 Human Gate 处理
-
-Core 必须支持：
-
-1. 接收 `zigma-flow` human gate waiting event。
-2. 创建 HumanGateRequest。
-3. 校验审批者权限。
-4. 接收 approve/reject decision。
-5. 将 decision 回传给 `zigma-flow`。
-6. 将 decision 写入 Evidence Bundle。
-
-### FR-009 Evidence Bundle 汇总
-
-Core 必须从 `zigma-flow` run 中收集 flow artifacts、event summary、validation evidence、workspace diff、external links 和 human decisions，生成 Evidence Bundle。
-
-### FR-010 代码交付协调
-
-Core 不直接创建 PR。短期由 `zigma-flow` script step 调用 `gh pr create`、`gh pr comment`、`gh run view` 等命令完成 GitHub 交付。平台化阶段可改为调用 `zigma-code` CLI/API。
-
-Core 负责记录交付意图、权限快照、交付结果链接和审计日志。
-
-### FR-011 权限快照
-
-Core 必须为每次 Task 和 Flow Run 生成权限快照，并记录到审计日志。权限快照不得在 run 中途隐式改变。需要变更权限时，应创建新的 revision 或新的 run。
-
-### FR-012 审计日志
-
-Core 必须记录项目变更、任务状态变更、flow 启动、workspace 关联、human gate 决策、证据包生成、代码平台交付动作。
-
-### FR-013 API
-
-Core 应提供最小 API：
+CoreService 提供以下用例：
 
 ```ts
-interface ZigmaCoreApi {
-  createProject(input: CreateProjectInput): Promise<Project>;
-  createTask(input: CreateTaskInput): Promise<ZigmaTask>;
-  startTask(taskId: string, options?: StartTaskOptions): Promise<FlowRunRef>;
-  getTask(taskId: string): Promise<ZigmaTask>;
-  getTaskStatus(taskId: string): Promise<TaskStatusView>;
-  approveGate(input: HumanGateDecisionInput): Promise<HumanGateRequest>;
-  rejectGate(input: HumanGateDecisionInput): Promise<HumanGateRequest>;
-  cancelTask(taskId: string, reason: string): Promise<void>;
-  collectEvidence(taskId: string): Promise<EvidenceBundle>;
-}
+createExecutionProfile(input)
+getExecutionProfile(id)
+createProject(input)
+getProject(id)
+createTask(input)
+getTask(id)
+getTaskView(id)
+startTask(taskId, input)
+recordFlowEvent(flowRunId, event)
+createHumanGate(input)
+decideHumanGate(gateId, input)
+addEvidenceItem(flowRunId, input)
+finalizeEvidence(flowRunId, input)
+getEvidence(flowRunId)
+cancelTask(taskId, reason)
+listTaskAudit(taskId)
 ```
 
-## 8. 数据模型
+## 7. 执行流程
 
-MVP 可以使用 SQLite 或 PostgreSQL。推荐表：
+### 7.1 Task 启动
+
+1. 读取 Task、Project 与 Execution Profile。
+2. 校验 Task 当前状态。
+3. 校验 `task:start` 与 `workflow:invoke`。
+4. 校验 Workflow 与 Repository Scope。
+5. 创建 Permission Snapshot。
+6. 创建 Flow Run 与 Evidence Bundle。
+7. Task 进入 queued。
+8. Task 进入 provisioning。
+9. Workspace Provider 创建 Workspace。
+10. 保存 Workspace Ref 并绑定 Flow Run。
+11. Flow Run 进入 starting，Task 进入 running。
+12. Flow Executor 启动 `zigma-flow`。
+13. 保存外部 Run ID、状态和退出码。
+14. 同步 Task 平台状态。
+15. 收集 Workspace Diff 与 Snapshot。
+16. 写入 Evidence Item 和 Audit Event。
+
+### 7.2 Human Gate
+
+1. Flow 或执行 Host 上报 Gate。
+2. Core 创建 HumanGate。
+3. Flow Run 与 Task 进入 awaiting_human。
+4. 外部入口提交决定。
+5. Core 校验 Capability 与 allowedApprovers。
+6. 保存 HumanDecision。
+7. 写入 Evidence Item。
+8. 调用 Flow Executor 恢复 Run。
+9. approve 后 Task 回到 running。
+10. reject 后 Task 进入 blocked。
+
+### 7.3 Flow 事件
+
+事件使用稳定 Event ID。Core 先插入事件记录。重复 Event ID 返回当前 Task View，不再次推进状态。
+
+## 8. 持久化模型
+
+MVP 使用 SQLite，表包括：
 
 ```text
+execution_profiles
 projects
-repositories
 tasks
-flow_run_refs
-workspace_refs
-human_gate_requests
+permission_snapshots
+flow_runs
+workspaces
+flow_events
+human_gates
 human_decisions
 evidence_bundles
-external_links
+evidence_items
 audit_events
-execution_profiles
-permission_snapshots
 ```
 
-## 9. 与其他组件关系
+关键唯一约束：
 
-### 9.1 与 zigma-flow
+- `execution_profiles.name`
+- `projects.key`
+- `workspaces(provider, external_id)`
+- `human_gates(flow_run_id, external_gate_id)`
+- `evidence_bundles(task_id, flow_run_id)`
+- `flow_events.id`
 
-Core 选择并启动 `zigma-flow` workflow，传入 task、inputs、caller context、workspace context 和 allowed tools。Core 不解释 flow DAG，不修改 flow state。
+## 9. API
 
-### 9.2 与 zigma-workspace
+MVP 提供 `/v1` HTTP API，详细内容见 `docs/api-contracts.md`。
 
-Core 可直接调用 `zigma-workspace` CLI/API 创建或查询 workspace，也可让 `zigma-flow` script step 调用 workspace CLI。长期 workspace 生命周期仍由 `zigma-workspace` 负责。
+核心端点：
 
-### 9.3 与 zigma-code
+```text
+POST /v1/execution-profiles
+POST /v1/projects
+POST /v1/tasks
+GET  /v1/tasks/:id
+POST /v1/tasks/:id/start
+POST /v1/tasks/:id/cancel
+POST /v1/flow-runs/:id/events
+POST /v1/human-gates
+POST /v1/human-gates/:id/decisions
+POST /v1/flow-runs/:id/evidence
+GET  /v1/flow-runs/:id/evidence
+POST /v1/flow-runs/:id/evidence/finalize
+GET  /v1/tasks/:id/audit-events
+```
 
-MVP 阶段不依赖 `zigma-code`。GitHub 操作可由 `zigma-flow` script step 直接调用 `gh`。平台化阶段，`gh` 命令可替换为 `zigma-code` CLI/API。
+## 10. 组件契约
 
-### 9.4 与 zigma-runner
+### 10.1 zigma-flow
 
-`zigma-runner` 已从当前架构中移除。未来只有在 Zigma 形成独立通用 job package 协议、需要分布式执行节点或强隔离 worker pool 时，才重新评估是否设计新的 runner。
+MVP 通过 CLI 调用 `invoke`、`resume` 和 `abort`。当前兼容层解析文本输出。目标契约要求 `invoke --json`、稳定 Run Result、结构化 Gate、事件回调和 Context File。
 
-## 10. MVP 范围
+### 10.2 zigma-workspace
 
-MVP 必须做到：
+MVP 使用现有 `--json` Envelope，并调用 create、bind-run、diff、snapshot 与 cleanup。目标契约增加 contract version、operation ID、稳定错误码和 state directory override。
 
-1. Project CRUD。
-2. Task CRUD 与基础状态机。
-3. Execution Profile 配置。
-4. 通过 CLI 启动 `zigma-flow`。
-5. 传递 Caller Context 和 flow inputs。
-6. 记录 FlowRunRef。
-7. 处理 Human Gate 镜像。
-8. 汇总 Evidence Bundle。
-9. 支持 workspace ref 和 external link 关联。
-10. 记录审计日志。
+详细内容见 `docs/integration-contracts.md`。
 
-MVP 可暂不实现：
+## 11. 安全要求
 
-1. Web Console。
-2. 邮件网关。
-3. `zigma-code` 集成。
-4. 远程 execution host。
-5. 分布式 runner pool。
-6. 多租户计费。
+1. Caller Context 必须在 Core 中完成 Schema 校验。
+2. Permission Snapshot 必须持久化并生成完整性哈希。
+3. Source 不得自动映射为权限。
+4. Gate 决策必须同时校验 Capability 与 Approver List。
+5. Core 不在 Audit Payload 中保存密钥。
+6. CLI Environment 仅来自 Execution Profile，生产实现应改用 Secret Reference。
+7. Artifact URI 需要在 WebUI 层按权限解析，不能直接暴露宿主文件路径。
+8. 外部回调在生产实现中必须使用签名或双向认证。
 
-## 11. DataCat 使用场景
+## 12. 可观测性
 
-### 11.1 MVP：直接 flow 驱动
+MVP 使用 Fastify 日志和 Audit Event。后续应增加：
 
-1. 用户创建 DataCat Task。
-2. Core 校验用户权限，生成 Caller Context。
-3. Core 根据 Project 配置选择 `code-change` workflow。
-4. Core 启动 `zigma-flow`。
-5. `zigma-flow` script step 调用 `git` / `gh` / `pnpm` / `zigma-workspace` 等 CLI。
-6. `zigma-flow` agent step 完成计划、实现、测试、审阅、总结。
-7. `zigma-flow` script step 可创建 draft PR 或写入 PR comment。
-8. Core 收集 flow artifacts、diff、PR link、validation evidence 和 human decisions。
-9. Core 生成 Evidence Bundle 并更新 Task 状态。
+- OpenTelemetry Trace
+- Task 与 Flow Run Correlation ID
+- Adapter Duration
+- State Transition Counter
+- Integration Failure Counter
+- Gate Waiting Duration
+- Evidence Collection Lag
 
-### 11.2 平台化：workspace/code 服务化
+## 13. MVP 验收标准
 
-1. Core 调用 `zigma-workspace` 创建 workspace。
-2. Core 启动 `zigma-flow` 并传入 workspace context。
-3. Flow script/check step 调用 `zigma-workspace` CLI/API 收集 diff、snapshot、cleanup。
-4. Flow script/check step 调用 `zigma-code` CLI/API 创建 PR、读取 check status 或写 review comment。
-5. Core 继续只负责权限、状态、审批和 evidence。
+1. 可创建 Execution Profile、Project 和 Task。
+2. 可在权限约束下启动 Task。
+3. 可创建 Workspace 并保存稳定引用。
+4. 可启动 Flow，保存外部 Run ID 与平台状态。
+5. 可处理 Human Gate 和审批决定。
+6. 可接收幂等 Flow Event。
+7. 可汇总 Workspace Diff、Snapshot、Flow Summary 和 Human Decision。
+8. 可查询 Task View 与审计事件。
+9. TypeScript 类型检查、单元测试和构建全部通过。
 
-## 12. 成功标准
+## 14. 演化计划
 
-1. Core 可以创建 DataCat Task 并启动一次 `zigma-flow` run。
-2. Core 不依赖 `zigma-runner`。
-3. Flow run 可以通过 script/check step 调用 `git`、`gh` 或 `zigma-workspace`。
-4. Core 能记录 FlowRunRef、workspace ref、external PR link 和 Evidence Bundle。
-5. Human Gate 可以在 Core 层被审批并回传给 flow。
-6. 架构边界清晰：Core 控制面，Flow 流程面，Workspace 工作区面，Code 平台化代码协作面。
+### P1 MVP Control Plane
 
-## 13. 风险与应对
+当前实现范围。
 
-### 风险一：Core 直接调用 flow 导致执行环境复杂
+### P2 Async Execution
 
-应对：用 Execution Profile 隔离不同启动方式。MVP 只支持 local-cli，未来再扩展 local-service 或 remote-host。
+增加 Outbox、Execution Command、Background Reconciler 和进程恢复。HTTP Start API 在此阶段实现真正异步。
 
-### 风险二：script step 调用 `gh` 造成平台耦合
+### P3 Policy and Identity
 
-应对：短期接受 CLI 依赖，所有输出必须作为 artifact/evidence 记录。平台化阶段替换为 `zigma-code`。
+增加 Organization、Membership、Role、Policy、Credential Reference 与签名回调。
 
-### 风险三：workspace 创建位置不统一
+### P4 Platform Integrations
 
-应对：允许 Core-first 和 flow-script 两种模式，但必须统一写入 WorkspaceRef 和 workspace context。
+接入 WebUI、Mail、Skill Registry 和代码平台。
 
-### 风险四：未来仍需要 Runner
+### P5 Distributed Control Plane
 
-应对：只有当出现通用 job package、分布式 worker pool、强隔离沙箱等明确需求时再重新设计，避免过早引入职责模糊组件。
-
-## 14. 开发阶段建议
-
-### P1 Core Skeleton
-
-建立项目、任务、配置、审计日志和本地数据库。
-
-### P2 Flow Invocation
-
-实现通过 CLI 启动 `zigma-flow`，记录 FlowRunRef，收集 summary 和 artifacts。
-
-### P3 Caller Context and Permission Snapshot
-
-定义权限快照 schema，并注入到 flow inputs/context。
-
-### P4 Human Gate Bridge
-
-实现 human gate request、approve/reject 和 evidence 记录。
-
-### P5 Evidence Bundle
-
-汇总 flow artifacts、diff、validation、external links 和 human decisions。
-
-### P6 DataCat Dogfood
-
-使用 DataCat 的真实任务验证无 Runner 架构闭环。
+迁移 PostgreSQL，引入远程 Execution Host、租约、心跳、调度和高可用部署。

@@ -1,0 +1,16 @@
+{
+  "projectId": "REPLACE_WITH_PROJECT_ID",
+  "title": "Implement a Zigma Core feature",
+  "description": "Implement the requested feature, run validation, and produce an evidence summary.",
+  "priority": "normal",
+  "source": {
+    "kind": "cli",
+    "metadata": {}
+  },
+  "createdBy": {
+    "type": "user",
+    "id": "local-operator"
+  },
+  "labels": ["example"],
+  "metadata": {}
+}

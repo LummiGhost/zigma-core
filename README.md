@@ -1,0 +1,96 @@
+# Zigma Core
+
+Zigma Core is the control plane of the Zigma platform. It owns long-lived project and task state, run-level permission snapshots, workspace and flow references, human approvals, evidence bundles, and audit events.
+
+The MVP is contract-first. Domain contracts are exported as TypeScript types and Zod schemas, while integrations with `zigma-flow` and `zigma-workspace` are isolated behind ports.
+
+## Current scope
+
+The MVP includes:
+
+- Project and execution profile registration
+- Task lifecycle and optimistic revision control
+- Immutable permission snapshots
+- `zigma-workspace` CLI integration
+- `zigma-flow` CLI integration
+- Human Gate registration and decisions
+- Evidence Bundle collection and finalization
+- Append-only audit events
+- SQLite persistence
+- HTTP API and administration CLI
+
+Distributed execution, organization membership, policy languages, mail ingestion, Web UI, and native code-hosting services remain outside the MVP.
+
+## Requirements
+
+- Node.js 22.5 or newer
+- `zigma-flow` available on `PATH` for real workflow execution
+- `zigma-workspace` available on `PATH` when a project uses the workspace CLI provider
+
+The MVP standardizes on Node.js 22 and uses the built-in `node:sqlite` module. `better-sqlite3` remains a possible optional adapter for deployments that need its native implementation, but it is not a runtime dependency and the MVP does not migrate to it. Persistence remains isolated in `SqliteStore` so a later adapter can preserve the application and API contracts.
+
+## Development
+
+```bash
+npm install
+npm run check
+```
+
+## Run the API
+
+```bash
+npm run build
+node dist/cli.js --db .zigma-core/core.db serve --host 127.0.0.1 --port 4736
+```
+
+Health check:
+
+```bash
+curl http://127.0.0.1:4736/health
+```
+
+## Bootstrap through the CLI
+
+Create an execution profile:
+
+```bash
+zigma-core --db .zigma-core/core.db profile create \
+  --file examples/execution-profile.json
+```
+
+Create a project after replacing `executionProfileId` in the example:
+
+```bash
+zigma-core --db .zigma-core/core.db project create \
+  --file examples/project.json
+```
+
+Create and start a task after replacing referenced IDs:
+
+```bash
+zigma-core --db .zigma-core/core.db task create --file examples/task.json
+zigma-core --db .zigma-core/core.db task start <task-id> --file examples/start-task.json
+```
+
+## Architecture
+
+The application core depends on two execution ports:
+
+```text
+HTTP API / CLI
+      |
+  CoreService
+      |
+      +-- SqliteStore
+      +-- FlowExecutor
+      +-- WorkspaceProvider
+```
+
+`CoreService` owns platform state transitions. `zigma-flow` continues to own workflow, job, and step transitions. `zigma-workspace` continues to own Git worktree and workspace mechanics.
+
+See:
+
+- `docs/prd.md`
+- `docs/architecture.md`
+- `docs/api-contracts.md`
+- `docs/integration-contracts.md`

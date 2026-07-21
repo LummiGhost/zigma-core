@@ -1,0 +1,207 @@
+import type {
+  ActorRef,
+  EvidenceKind,
+  FlowRunStatus,
+  PermissionConstraints,
+  RepositoryBinding,
+  TaskSource,
+  WorkspacePolicy
+} from "../contracts/schemas.js";
+
+export type ProjectStatus = "active" | "archived";
+export type TaskStatus =
+  | "created"
+  | "queued"
+  | "provisioning"
+  | "running"
+  | "awaiting_human"
+  | "blocked"
+  | "completed"
+  | "failed"
+  | "cancelled";
+export type GateStatus =
+  | "awaiting"
+  | "decision_pending"
+  | "decision_failed"
+  | "approved"
+  | "rejected"
+  | "expired"
+  | "cancelled";
+export type WorkspaceStatus = "preparing" | "ready" | "active" | "released" | "failed";
+export type EvidenceBundleStatus = "open" | "finalized";
+
+export interface ExecutionProfile {
+  id: string;
+  name: string;
+  mode: "local-cli" | "local-service" | "remote-host";
+  flowCommand: string;
+  workspaceCommand: string;
+  timeoutMs: number;
+  environment: Record<string, string>;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface Project {
+  id: string;
+  key: string;
+  displayName: string;
+  description?: string;
+  status: ProjectStatus;
+  repositories: RepositoryBinding[];
+  defaultRepositoryId: string;
+  defaultWorkflowRef: string;
+  executionProfileId: string;
+  workspacePolicy: WorkspacePolicy;
+  skillProfileRef?: string;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+  archivedAt?: string;
+}
+
+export interface TaskFailure {
+  code: string;
+  message: string;
+  details: Record<string, unknown>;
+}
+
+export interface Task {
+  id: string;
+  projectId: string;
+  title: string;
+  description: string;
+  priority: "low" | "normal" | "high" | "urgent";
+  source: TaskSource;
+  createdBy: ActorRef;
+  status: TaskStatus;
+  labels: string[];
+  metadata: Record<string, unknown>;
+  activeFlowRunId?: string;
+  revision: number;
+  failure?: TaskFailure;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+
+export interface PermissionSnapshot {
+  id: string;
+  taskId: string;
+  actor: ActorRef;
+  capabilities: string[];
+  constraints: PermissionConstraints;
+  source: TaskSource;
+  hash: string;
+  createdAt: string;
+  expiresAt?: string;
+}
+
+export interface WorkspaceRef {
+  id: string;
+  taskId: string;
+  flowRunId: string;
+  provider: string;
+  externalId: string;
+  path: string;
+  repositoryUrl: string;
+  baseRef: string;
+  baseCommit: string;
+  branch: string;
+  mode: "writable" | "read-only";
+  status: WorkspaceStatus;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+  releasedAt?: string;
+}
+
+export interface FlowRun {
+  id: string;
+  taskId: string;
+  workflowRef: string;
+  executionProfileId: string;
+  permissionSnapshotId: string;
+  workspaceId?: string;
+  externalRunId?: string;
+  status: FlowRunStatus;
+  attempt: number;
+  inputs: Record<string, string>;
+  context: Record<string, unknown>;
+  exitCode?: number;
+  error?: TaskFailure;
+  startedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+
+export interface HumanGate {
+  id: string;
+  externalGateId: string;
+  taskId: string;
+  flowRunId: string;
+  jobId: string;
+  stepId: string;
+  prompt: string;
+  inputSchema: Record<string, unknown>;
+  allowedApprovers: ActorRef[];
+  status: GateStatus;
+  dueAt?: string;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface HumanDecision {
+  id: string;
+  gateId: string;
+  actor: ActorRef;
+  decision: "approve" | "reject";
+  comment?: string;
+  input: Record<string, unknown>;
+  deliveryStatus: "pending" | "failed" | "delivered";
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface EvidenceBundle {
+  id: string;
+  taskId: string;
+  flowRunId: string;
+  status: EvidenceBundleStatus;
+  summary?: string;
+  risks: string[];
+  conclusions: string[];
+  createdAt: string;
+  updatedAt: string;
+  finalizedAt?: string;
+}
+
+export interface EvidenceItem {
+  id: string;
+  bundleId: string;
+  kind: EvidenceKind;
+  name: string;
+  uri: string;
+  mediaType?: string;
+  digest?: string;
+  sizeBytes?: number;
+  summary?: string;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface AuditEvent {
+  id: string;
+  aggregateType: "project" | "task" | "flow-run" | "workspace" | "human-gate" | "evidence-bundle" | "execution-profile";
+  aggregateId: string;
+  action: string;
+  actor: ActorRef;
+  payload: Record<string, unknown>;
+  correlationId?: string;
+  causationId?: string;
+  createdAt: string;
+}
