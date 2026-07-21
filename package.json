@@ -1,0 +1,37 @@
+{
+  "name": "@zigma-ai/zigma-core",
+  "version": "0.1.0",
+  "description": "Zigma platform control plane: projects, tasks, permission snapshots, human gate mirroring, and evidence bundles.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "zigma-core": "./dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "docs"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli/index.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "smoke": "node dist/cli/index.js --help"
+  },
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "commander": "^12.1.0",
+    "execa": "^9.6.1",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^20.19.42",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.9"
+  }
+}
