@@ -76,7 +76,8 @@ function parseInvokeJson(stdout: string, processExitCode: number): FlowStartResu
   };
 }
 
-function buildContextFilePayload(request: FlowStartRequest): Record<string, unknown> {
+/** Exported for testing */
+export function buildContextFilePayload(request: FlowStartRequest): Record<string, unknown> {
   return {
     permissionSnapshotId: request.permissionSnapshotId ?? null,
     integrityHash: request.integrityHash ?? null,
@@ -87,7 +88,7 @@ function buildContextFilePayload(request: FlowStartRequest): Record<string, unkn
       maxRunDurationMs: request.callerContext.constraints.maxRunDurationMs ?? null
     },
     source: request.callerContext.source,
-    coreCallbackUrl: request.coreCallbackUrl ?? "http://127.0.0.1:4736/v1",
+    coreCallbackUrl: request.coreCallbackUrl,
     actor: request.callerContext.actor,
     flowRunId: request.flowRunId,
     taskId: request.taskId
@@ -97,7 +98,6 @@ function buildContextFilePayload(request: FlowStartRequest): Record<string, unkn
 export class LocalCliFlowExecutor implements FlowExecutor {
   async start(request: FlowStartRequest): Promise<FlowStartResult> {
     const contextFilePath = join(tmpdir(), `zigma-ctx-${request.flowRunId}.json`);
-    await writeFile(contextFilePath, JSON.stringify(buildContextFilePayload(request), null, 2), "utf8");
 
     const args = [
       "--cwd",
@@ -118,6 +118,7 @@ export class LocalCliFlowExecutor implements FlowExecutor {
     if (request.dryRun) args.push("--dry-run");
 
     try {
+      await writeFile(contextFilePath, JSON.stringify(buildContextFilePayload(request), null, 2), "utf8");
       const result = await execa(request.command, args, {
         cwd: request.projectRoot,
         env: { ...process.env, ...request.environment },

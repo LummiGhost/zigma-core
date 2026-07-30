@@ -7,7 +7,7 @@ vi.mock("execa", () => ({
 }));
 
 // Dynamic import so the mock is in place before the module loads
-const { LocalCliFlowExecutor } = await import("../../src/adapters/local-cli-flow.js");
+const { LocalCliFlowExecutor, buildContextFilePayload } = await import("../../src/adapters/local-cli-flow.js");
 
 function jsonEnvelope(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({
@@ -69,7 +69,7 @@ describe("LocalCliFlowExecutor.start", () => {
     });
   });
 
-  it("passes --json to zigma-flow invoke", async () => {
+  it("passes --json and --context-file to zigma-flow invoke", async () => {
     mockExeca.mockResolvedValueOnce({
       stdout: jsonEnvelope(),
       all: jsonEnvelope(),
@@ -82,6 +82,7 @@ describe("LocalCliFlowExecutor.start", () => {
     expect(lastCall).toBeDefined();
     const args = lastCall![1] as string[];
     expect(args).toContain("--json");
+    expect(args).toContain("--context-file");
   });
 
   it("throws IntegrationError when stdout is not valid JSON", async () => {
@@ -208,5 +209,43 @@ describe("LocalCliFlowExecutor.start", () => {
       artifacts: [{ name: "report.txt", uri: "file:///tmp/report.txt" }],
       eventLogUri: "file:///tmp/custom-events.jsonl"
     });
+  });
+});
+
+describe("buildContextFilePayload", () => {
+  it("builds a structured payload from a FlowStartRequest", () => {
+    const request = defaultRequest({
+      permissionSnapshotId: "snap-1",
+      integrityHash: "abc123def",
+      coreCallbackUrl: "http://127.0.0.1:4736/v1"
+    });
+
+    const payload = buildContextFilePayload(request);
+
+    expect(payload).toEqual({
+      permissionSnapshotId: "snap-1",
+      integrityHash: "abc123def",
+      capabilities: ["task:create"],
+      constraints: {
+        allowedRepos: [],
+        allowedBranches: [],
+        maxRunDurationMs: null
+      },
+      source: { kind: "api", metadata: {} },
+      coreCallbackUrl: "http://127.0.0.1:4736/v1",
+      actor: { type: "user", id: "alice" },
+      flowRunId: "fr-1",
+      taskId: "task-1"
+    });
+  });
+
+  it("defaults null for optional fields", () => {
+    const request = defaultRequest();
+
+    const payload = buildContextFilePayload(request);
+
+    expect(payload.permissionSnapshotId).toBeNull();
+    expect(payload.integrityHash).toBeNull();
+    expect(payload.coreCallbackUrl).toBeUndefined();
   });
 });
