@@ -57,6 +57,12 @@ export interface FlowStartRequest {
   projectRoot: string;
   inputs: Record<string, string>;
   callerContext: CallerContext;
+  /** ID of the PermissionSnapshot stored in Core. Sent via --context-file so zigma-flow can cross-reference. */
+  permissionSnapshotId?: string;
+  /** Stable hash of the caller context. Sent via --context-file for integrity verification. */
+  integrityHash?: string;
+  /** Base URL of the Core API (e.g. http://127.0.0.1:4736/v1). Sent via --context-file so zigma-flow can call back. */
+  coreCallbackUrl?: string;
   backend?: string;
   parallelism?: number;
   timeoutMs: number;
@@ -69,6 +75,7 @@ export interface FlowStartResult {
   status: FlowRunStatus;
   exitCode: number;
   summary?: string;
+  /** When populated from zigma-flow --json: pausedGate, artifacts, eventLogUri */
   metadata: Record<string, unknown>;
 }
 

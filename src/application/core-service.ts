@@ -375,6 +375,9 @@ export class CoreService {
           ...(workspace ? { zigma_workspace_id: workspace.externalId } : {})
         },
         callerContext: input.callerContext,
+        permissionSnapshotId: permissionSnapshot.id,
+        integrityHash: permissionSnapshot.hash,
+        coreCallbackUrl: process.env["ZIGMA_CORE_URL"] ?? "http://127.0.0.1:4736/v1",
         ...(input.backend !== undefined ? { backend: input.backend } : {}),
         ...(input.parallelism !== undefined ? { parallelism: input.parallelism } : {}),
         timeoutMs: input.callerContext.constraints.maxRunDurationMs ?? profile.timeoutMs,
