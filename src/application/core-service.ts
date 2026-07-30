@@ -383,7 +383,22 @@ export class CoreService {
       });
 
       this.applyFlowResult(flowRun.id, result, input.callerContext.actor);
-      await this.collectWorkspaceEvidence(flowRun.id, profile);
+      try {
+        await this.collectWorkspaceEvidence(flowRun.id, profile);
+      } catch (evidenceError) {
+        const message = evidenceError instanceof Error ? evidenceError.message : String(evidenceError);
+        const bundle = this.store.getEvidenceBundleByRun(flowRun.id);
+        this.store.updateEvidenceBundle({
+          ...bundle,
+          status: "incomplete",
+          updatedAt: this.clock.now()
+        });
+        this.audit("task", bundle.taskId, "evidence.collection_failed", SYSTEM_ACTOR, {
+          flowRunId: flowRun.id,
+          bundleId: bundle.id,
+          error: message
+        }, bundle.taskId);
+      }
       return this.getTaskView(task.id);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

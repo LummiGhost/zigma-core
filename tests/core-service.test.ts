@@ -302,4 +302,78 @@ describe("CoreService", () => {
     await expect(core.startTask(task.id, input)).rejects.toBeInstanceOf(ForbiddenError);
     expect(core.getTask(task.id).status).toBe("created");
   });
+
+  it("completes task when evidence collection fails without affecting task status", async () => {
+    class FailingEvidenceWorkspace extends FakeWorkspace {
+      async collectEvidence(): Promise<WorkspaceEvidence> {
+        throw new Error("workspace already cleaned up");
+      }
+    }
+
+    const store = new SqliteStore(":memory:");
+    stores.push(store);
+    const flow = new FakeFlow();
+    const core = new CoreService({
+      store,
+      flowExecutor: flow,
+      workspaceProvider: new FailingEvidenceWorkspace(),
+      clock: new FakeClock(),
+      ids: new FakeIds()
+    });
+    const profile = core.createExecutionProfile({
+      name: "local",
+      mode: "local-cli",
+      flowCommand: "zigma-flow",
+      workspaceCommand: "zigma-workspace",
+      timeoutMs: 60_000,
+      environment: {},
+      metadata: {}
+    });
+    const project = core.createProject({
+      key: "zigma-core",
+      displayName: "Zigma Core",
+      repositories: [
+        {
+          id: "main",
+          provider: "github",
+          url: "https://github.com/LummiGhost/zigma-core.git",
+          defaultRef: "main",
+          writable: true,
+          metadata: {}
+        }
+      ],
+      defaultRepositoryId: "main",
+      defaultWorkflowRef: "code-change",
+      executionProfileId: profile.id,
+      workspacePolicy: {
+        provider: "zigma-workspace-cli",
+        mode: "writable",
+        branchTemplate: "zigma/{taskId}",
+        cleanup: "manual",
+        snapshotOnTerminal: true
+      },
+      metadata: {}
+    });
+    const task = core.createTask({
+      projectId: project.id,
+      title: "Implement model",
+      description: "Implement the model and tests",
+      priority: "high",
+      source: { kind: "api", metadata: {} },
+      createdBy: { type: "user", id: "owner" },
+      labels: ["mvp"],
+      metadata: {}
+    });
+
+    const view = await core.startTask(task.id, startInput());
+
+    expect(view.task.status).toBe("completed");
+    expect(view.activeFlowRun?.status).toBe("completed");
+    expect(view.evidence?.bundle.status).toBe("incomplete");
+
+    const auditActions = core.listTaskAudit(task.id).map((e) => e.action);
+    expect(auditActions).toContain("evidence.collection_failed");
+    expect(auditActions).toContain("task.completed");
+    expect(auditActions).not.toContain("task.failed");
+  });
 });
