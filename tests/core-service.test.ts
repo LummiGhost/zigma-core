@@ -15,7 +15,7 @@ import type {
 import { CoreService } from "../src/application/core-service.js";
 import type { DecideHumanGateInput } from "../src/contracts/schemas.js";
 import { SqliteStore } from "../src/persistence/sqlite-store.js";
-import { ForbiddenError } from "../src/domain/errors.js";
+import { ConflictError, ForbiddenError } from "../src/domain/errors.js";
 
 class FakeClock implements Clock {
   private tick = 0;
@@ -92,14 +92,14 @@ afterEach(() => {
   for (const store of stores.splice(0)) store.close();
 });
 
-function setup() {
+function setup(options?: { workspaceProvider?: WorkspaceProvider }) {
   const store = new SqliteStore(":memory:");
   stores.push(store);
   const flow = new FakeFlow();
   const core = new CoreService({
     store,
     flowExecutor: flow,
-    workspaceProvider: new FakeWorkspace(),
+    workspaceProvider: options?.workspaceProvider ?? new FakeWorkspace(),
     clock: new FakeClock(),
     ids: new FakeIds()
   });
@@ -310,66 +310,24 @@ describe("CoreService", () => {
       }
     }
 
-    const store = new SqliteStore(":memory:");
-    stores.push(store);
-    const flow = new FakeFlow();
-    const core = new CoreService({
-      store,
-      flowExecutor: flow,
-      workspaceProvider: new FailingEvidenceWorkspace(),
-      clock: new FakeClock(),
-      ids: new FakeIds()
-    });
-    const profile = core.createExecutionProfile({
-      name: "local",
-      mode: "local-cli",
-      flowCommand: "zigma-flow",
-      workspaceCommand: "zigma-workspace",
-      timeoutMs: 60_000,
-      environment: {},
-      metadata: {}
-    });
-    const project = core.createProject({
-      key: "zigma-core",
-      displayName: "Zigma Core",
-      repositories: [
-        {
-          id: "main",
-          provider: "github",
-          url: "https://github.com/LummiGhost/zigma-core.git",
-          defaultRef: "main",
-          writable: true,
-          metadata: {}
-        }
-      ],
-      defaultRepositoryId: "main",
-      defaultWorkflowRef: "code-change",
-      executionProfileId: profile.id,
-      workspacePolicy: {
-        provider: "zigma-workspace-cli",
-        mode: "writable",
-        branchTemplate: "zigma/{taskId}",
-        cleanup: "manual",
-        snapshotOnTerminal: true
-      },
-      metadata: {}
-    });
-    const task = core.createTask({
-      projectId: project.id,
-      title: "Implement model",
-      description: "Implement the model and tests",
-      priority: "high",
-      source: { kind: "api", metadata: {} },
-      createdBy: { type: "user", id: "owner" },
-      labels: ["mvp"],
-      metadata: {}
-    });
+    const { core, task } = setup({ workspaceProvider: new FailingEvidenceWorkspace() });
 
     const view = await core.startTask(task.id, startInput());
 
     expect(view.task.status).toBe("completed");
     expect(view.activeFlowRun?.status).toBe("completed");
     expect(view.evidence?.bundle.status).toBe("incomplete");
+    expect(() => core.addEvidenceItem(view.activeFlowRun!.id, {
+      kind: "workspace-diff",
+      name: "late evidence",
+      uri: "file:///tmp/late.patch",
+      metadata: {}
+    })).toThrow(ConflictError);
+    expect(core.finalizeEvidence(view.activeFlowRun!.id, {
+      summary: "must not finalize",
+      risks: [],
+      conclusions: []
+    }).status).toBe("incomplete");
 
     const auditActions = core.listTaskAudit(task.id).map((e) => e.action);
     expect(auditActions).toContain("evidence.collection_failed");

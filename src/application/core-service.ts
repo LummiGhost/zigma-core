@@ -35,8 +35,13 @@ import type {
   TaskStatus,
   WorkspaceRef
 } from "../domain/models.js";
-import { ConflictError, ForbiddenError, IntegrationError } from "../domain/errors.js";
-import { assertFlowTransition, assertGateTransition, assertTaskTransition } from "../domain/state-machines.js";
+import { ConflictError, ForbiddenError, IntegrationError, NotFoundError } from "../domain/errors.js";
+import {
+  assertEvidenceBundleTransition,
+  assertFlowTransition,
+  assertGateTransition,
+  assertTaskTransition
+} from "../domain/state-machines.js";
 import { SqliteStore } from "../persistence/sqlite-store.js";
 import { stableHash } from "./runtime.js";
 
@@ -387,17 +392,7 @@ export class CoreService {
         await this.collectWorkspaceEvidence(flowRun.id, profile);
       } catch (evidenceError) {
         const message = evidenceError instanceof Error ? evidenceError.message : String(evidenceError);
-        const bundle = this.store.getEvidenceBundleByRun(flowRun.id);
-        this.store.updateEvidenceBundle({
-          ...bundle,
-          status: "incomplete",
-          updatedAt: this.clock.now()
-        });
-        this.audit("task", bundle.taskId, "evidence.collection_failed", SYSTEM_ACTOR, {
-          flowRunId: flowRun.id,
-          bundleId: bundle.id,
-          error: message
-        }, bundle.taskId);
+        this.markEvidenceCollectionIncomplete(flowRun.id, task.id, message);
       }
       return this.getTaskView(task.id);
     } catch (error) {
@@ -651,8 +646,11 @@ export class CoreService {
   addEvidenceItem(flowRunId: string, raw: AddEvidenceItemInput): EvidenceItem {
     const input = AddEvidenceItemInputSchema.parse(raw);
     const bundle = this.store.getEvidenceBundleByRun(flowRunId);
-    if (bundle.status === "finalized") {
-      throw new ConflictError("Cannot add evidence to a finalized bundle", { bundleId: bundle.id });
+    if (bundle.status !== "open") {
+      throw new ConflictError("Cannot add evidence to a closed bundle", {
+        bundleId: bundle.id,
+        status: bundle.status
+      });
     }
     const item: EvidenceItem = {
       id: this.ids.next("item"),
@@ -679,7 +677,7 @@ export class CoreService {
   finalizeEvidence(flowRunId: string, raw: FinalizeEvidenceInput): EvidenceBundle {
     const input = FinalizeEvidenceInputSchema.parse(raw);
     const bundle = this.store.getEvidenceBundleByRun(flowRunId);
-    if (bundle.status === "finalized") return bundle;
+    if (bundle.status !== "open") return bundle;
     const now = this.clock.now();
     const finalized: EvidenceBundle = {
       ...bundle,
@@ -696,6 +694,36 @@ export class CoreService {
       riskCount: finalized.risks.length
     }, bundle.taskId);
     return finalized;
+  }
+
+  private markEvidenceCollectionIncomplete(flowRunId: string, taskId: string, message: string): void {
+    let bundle: EvidenceBundle;
+    try {
+      bundle = this.store.getEvidenceBundleByRun(flowRunId);
+    } catch (error) {
+      if (!(error instanceof NotFoundError)) throw error;
+      this.audit("task", taskId, "evidence.collection_failed", SYSTEM_ACTOR, {
+        flowRunId,
+        error: message,
+        bundleMissing: true
+      }, taskId);
+      return;
+    }
+
+    assertEvidenceBundleTransition(bundle.status, "incomplete");
+    const incomplete: EvidenceBundle = {
+      ...bundle,
+      status: "incomplete",
+      updatedAt: this.clock.now()
+    };
+    this.store.transaction(() => {
+      this.store.updateEvidenceBundle(incomplete);
+      this.audit("task", taskId, "evidence.collection_failed", SYSTEM_ACTOR, {
+        flowRunId,
+        bundleId: bundle.id,
+        error: message
+      }, taskId);
+    });
   }
 
   getEvidence(flowRunId: string): { bundle: EvidenceBundle; items: EvidenceItem[] } {
