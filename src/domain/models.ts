@@ -28,7 +28,7 @@ export type GateStatus =
   | "expired"
   | "cancelled";
 export type WorkspaceStatus = "preparing" | "ready" | "active" | "released" | "failed";
-export type EvidenceBundleStatus = "open" | "finalized";
+export type EvidenceBundleStatus = "open" | "finalized" | "incomplete";
 
 export interface ExecutionProfile {
   id: string;
