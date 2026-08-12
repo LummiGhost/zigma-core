@@ -34,7 +34,6 @@ const gateTransitions: Record<GateStatus, ReadonlySet<GateStatus>> = {
   cancelled: new Set()
 };
 
-// Evidence bundle transitions: "incomplete" is terminal — no outbound transitions.
 const evidenceBundleTransitions: Record<EvidenceBundleStatus, ReadonlySet<EvidenceBundleStatus>> = {
   open: new Set(["finalized", "incomplete"]),
   finalized: new Set(),

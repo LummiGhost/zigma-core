@@ -15,7 +15,7 @@ import type {
 import { CoreService } from "../src/application/core-service.js";
 import type { DecideHumanGateInput } from "../src/contracts/schemas.js";
 import { SqliteStore } from "../src/persistence/sqlite-store.js";
-import { ForbiddenError } from "../src/domain/errors.js";
+import { ConflictError, ForbiddenError } from "../src/domain/errors.js";
 
 class FakeClock implements Clock {
   private tick = 0;
@@ -92,14 +92,14 @@ afterEach(() => {
   for (const store of stores.splice(0)) store.close();
 });
 
-function setup(opts?: { workspaceProvider?: WorkspaceProvider }) {
+function setup(options?: { workspaceProvider?: WorkspaceProvider }) {
   const store = new SqliteStore(":memory:");
   stores.push(store);
   const flow = new FakeFlow();
   const core = new CoreService({
     store,
     flowExecutor: flow,
-    workspaceProvider: opts?.workspaceProvider ?? new FakeWorkspace(),
+    workspaceProvider: options?.workspaceProvider ?? new FakeWorkspace(),
     clock: new FakeClock(),
     ids: new FakeIds()
   });
@@ -317,6 +317,17 @@ describe("CoreService", () => {
     expect(view.task.status).toBe("completed");
     expect(view.activeFlowRun?.status).toBe("completed");
     expect(view.evidence?.bundle.status).toBe("incomplete");
+    expect(() => core.addEvidenceItem(view.activeFlowRun!.id, {
+      kind: "workspace-diff",
+      name: "late evidence",
+      uri: "file:///tmp/late.patch",
+      metadata: {}
+    })).toThrow(ConflictError);
+    expect(core.finalizeEvidence(view.activeFlowRun!.id, {
+      summary: "must not finalize",
+      risks: [],
+      conclusions: []
+    }).status).toBe("incomplete");
 
     const auditActions = core.listTaskAudit(task.id).map((e) => e.action);
     expect(auditActions).toContain("evidence.collection_failed");
