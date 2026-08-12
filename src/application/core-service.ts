@@ -36,7 +36,7 @@ import type {
   WorkspaceRef
 } from "../domain/models.js";
 import { ConflictError, ForbiddenError, IntegrationError } from "../domain/errors.js";
-import { assertFlowTransition, assertGateTransition, assertTaskTransition } from "../domain/state-machines.js";
+import { assertEvidenceBundleTransition, assertFlowTransition, assertGateTransition, assertTaskTransition } from "../domain/state-machines.js";
 import { SqliteStore } from "../persistence/sqlite-store.js";
 import { stableHash } from "./runtime.js";
 
@@ -386,7 +386,26 @@ export class CoreService {
       });
 
       this.applyFlowResult(flowRun.id, result, input.callerContext.actor);
-      await this.collectWorkspaceEvidence(flowRun.id, profile);
+      try {
+        await this.collectWorkspaceEvidence(flowRun.id, profile);
+      } catch (evidenceError) {
+        const message = evidenceError instanceof Error ? evidenceError.message : String(evidenceError);
+        try {
+          const bundle = this.store.getEvidenceBundleByRun(flowRun.id);
+          this.store.updateEvidenceBundle({
+            ...bundle,
+            status: "incomplete",
+            updatedAt: this.clock.now()
+          });
+          this.audit("task", bundle.taskId, "evidence.collection_failed", SYSTEM_ACTOR, {
+            flowRunId: flowRun.id,
+            bundleId: bundle.id,
+            error: message
+          }, bundle.taskId);
+        } catch {
+          // bundle not found — evidence collection failed before bundle was created, nothing to update
+        }
+      }
       return this.getTaskView(task.id);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -639,8 +658,8 @@ export class CoreService {
   addEvidenceItem(flowRunId: string, raw: AddEvidenceItemInput): EvidenceItem {
     const input = AddEvidenceItemInputSchema.parse(raw);
     const bundle = this.store.getEvidenceBundleByRun(flowRunId);
-    if (bundle.status === "finalized") {
-      throw new ConflictError("Cannot add evidence to a finalized bundle", { bundleId: bundle.id });
+    if (bundle.status === "finalized" || bundle.status === "incomplete") {
+      throw new ConflictError("Cannot add evidence to a finalized or incomplete bundle", { bundleId: bundle.id });
     }
     const item: EvidenceItem = {
       id: this.ids.next("item"),
@@ -667,7 +686,7 @@ export class CoreService {
   finalizeEvidence(flowRunId: string, raw: FinalizeEvidenceInput): EvidenceBundle {
     const input = FinalizeEvidenceInputSchema.parse(raw);
     const bundle = this.store.getEvidenceBundleByRun(flowRunId);
-    if (bundle.status === "finalized") return bundle;
+    if (bundle.status === "finalized" || bundle.status === "incomplete") return bundle;
     const now = this.clock.now();
     const finalized: EvidenceBundle = {
       ...bundle,

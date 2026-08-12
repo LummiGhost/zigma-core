@@ -1,5 +1,5 @@
 import { ConflictError } from "./errors.js";
-import type { GateStatus, TaskStatus } from "./models.js";
+import type { EvidenceBundleStatus, GateStatus, TaskStatus } from "./models.js";
 import type { FlowRunStatus } from "../contracts/schemas.js";
 
 const taskTransitions: Record<TaskStatus, ReadonlySet<TaskStatus>> = {
@@ -34,6 +34,13 @@ const gateTransitions: Record<GateStatus, ReadonlySet<GateStatus>> = {
   cancelled: new Set()
 };
 
+// Evidence bundle transitions: "incomplete" is terminal — no outbound transitions.
+const evidenceBundleTransitions: Record<EvidenceBundleStatus, ReadonlySet<EvidenceBundleStatus>> = {
+  open: new Set(["finalized", "incomplete"]),
+  finalized: new Set(),
+  incomplete: new Set()
+};
+
 export function assertTaskTransition(from: TaskStatus, to: TaskStatus): void {
   if (from === to) return;
   if (!taskTransitions[from].has(to)) {
@@ -52,5 +59,12 @@ export function assertGateTransition(from: GateStatus, to: GateStatus): void {
   if (from === to) return;
   if (!gateTransitions[from].has(to)) {
     throw new ConflictError(`Invalid human gate transition: ${from} -> ${to}`, { from, to });
+  }
+}
+
+export function assertEvidenceBundleTransition(from: EvidenceBundleStatus, to: EvidenceBundleStatus): void {
+  if (from === to) return;
+  if (!evidenceBundleTransitions[from].has(to)) {
+    throw new ConflictError(`Invalid evidence bundle transition: ${from} -> ${to}`, { from, to });
   }
 }

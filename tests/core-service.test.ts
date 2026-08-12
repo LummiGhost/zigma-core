@@ -92,14 +92,14 @@ afterEach(() => {
   for (const store of stores.splice(0)) store.close();
 });
 
-function setup() {
+function setup(opts?: { workspaceProvider?: WorkspaceProvider }) {
   const store = new SqliteStore(":memory:");
   stores.push(store);
   const flow = new FakeFlow();
   const core = new CoreService({
     store,
     flowExecutor: flow,
-    workspaceProvider: new FakeWorkspace(),
+    workspaceProvider: opts?.workspaceProvider ?? new FakeWorkspace(),
     clock: new FakeClock(),
     ids: new FakeIds()
   });
@@ -301,5 +301,26 @@ describe("CoreService", () => {
 
     await expect(core.startTask(task.id, input)).rejects.toBeInstanceOf(ForbiddenError);
     expect(core.getTask(task.id).status).toBe("created");
+  });
+
+  it("completes task when evidence collection fails without affecting task status", async () => {
+    class FailingEvidenceWorkspace extends FakeWorkspace {
+      async collectEvidence(): Promise<WorkspaceEvidence> {
+        throw new Error("workspace already cleaned up");
+      }
+    }
+
+    const { core, task } = setup({ workspaceProvider: new FailingEvidenceWorkspace() });
+
+    const view = await core.startTask(task.id, startInput());
+
+    expect(view.task.status).toBe("completed");
+    expect(view.activeFlowRun?.status).toBe("completed");
+    expect(view.evidence?.bundle.status).toBe("incomplete");
+
+    const auditActions = core.listTaskAudit(task.id).map((e) => e.action);
+    expect(auditActions).toContain("evidence.collection_failed");
+    expect(auditActions).toContain("task.completed");
+    expect(auditActions).not.toContain("task.failed");
   });
 });
