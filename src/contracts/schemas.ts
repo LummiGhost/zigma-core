@@ -85,16 +85,63 @@ export const WorkspacePolicySchema = z.object({
 });
 export type WorkspacePolicy = z.infer<typeof WorkspacePolicySchema>;
 
+export const DEFAULT_EXECUTION_POLICY = {
+  contractVersion: 1 as const,
+  capacity: {
+    global: 4,
+    perProject: 4,
+    perRepository: 2,
+    perBackend: 4
+  },
+  admission: {
+    writablePerRepository: 1,
+    queueDiscipline: "fifo" as const,
+    requireDistinctWorkspace: true as const
+  }
+};
+
+export const ExecutionCapacitySchema = z.object({
+  global: z.number().int().positive().max(10_000).default(DEFAULT_EXECUTION_POLICY.capacity.global),
+  perProject: z.number().int().positive().max(10_000).default(DEFAULT_EXECUTION_POLICY.capacity.perProject),
+  perRepository: z.number().int().positive().max(10_000).default(DEFAULT_EXECUTION_POLICY.capacity.perRepository),
+  perBackend: z.number().int().positive().max(10_000).default(DEFAULT_EXECUTION_POLICY.capacity.perBackend)
+});
+export type ExecutionCapacity = z.infer<typeof ExecutionCapacitySchema>;
+
+export const AdmissionPolicySchema = z.object({
+  writablePerRepository: z.number().int().positive().max(10_000)
+    .default(DEFAULT_EXECUTION_POLICY.admission.writablePerRepository),
+  queueDiscipline: z.literal("fifo").default(DEFAULT_EXECUTION_POLICY.admission.queueDiscipline),
+  requireDistinctWorkspace: z.literal(true).default(DEFAULT_EXECUTION_POLICY.admission.requireDistinctWorkspace)
+});
+export type AdmissionPolicy = z.infer<typeof AdmissionPolicySchema>;
+
+export const ExecutionPolicySchema = z.object({
+  contractVersion: z.literal(1).default(DEFAULT_EXECUTION_POLICY.contractVersion),
+  capacity: ExecutionCapacitySchema.default(DEFAULT_EXECUTION_POLICY.capacity),
+  admission: AdmissionPolicySchema.default(DEFAULT_EXECUTION_POLICY.admission)
+}).superRefine((value, ctx) => {
+  if (value.admission.writablePerRepository > value.capacity.perRepository) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["admission", "writablePerRepository"],
+      message: "writablePerRepository cannot exceed capacity.perRepository"
+    });
+  }
+});
+export type ExecutionPolicy = z.infer<typeof ExecutionPolicySchema>;
+
 export const CreateExecutionProfileInputSchema = z.object({
   name: z.string().min(1).max(128),
   mode: z.enum(["local-cli", "local-service", "remote-host"]).default("local-cli"),
   flowCommand: z.string().min(1).default("zigma-flow"),
   workspaceCommand: z.string().min(1).default("zigma-workspace"),
   timeoutMs: z.number().int().positive().default(3_600_000),
+  executionPolicy: ExecutionPolicySchema.default(DEFAULT_EXECUTION_POLICY),
   environment: z.record(z.string(), z.string()).default({}),
   metadata: z.record(z.string(), z.unknown()).default({})
 });
-export type CreateExecutionProfileInput = z.infer<typeof CreateExecutionProfileInputSchema>;
+export type CreateExecutionProfileInput = z.input<typeof CreateExecutionProfileInputSchema>;
 
 export const CreateProjectInputSchema = z.object({
   key: z.string().regex(/^[a-z0-9][a-z0-9-]{1,62}$/),

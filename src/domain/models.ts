@@ -1,6 +1,7 @@
 import type {
   ActorRef,
   EvidenceKind,
+  ExecutionPolicy,
   FlowRunStatus,
   PermissionConstraints,
   RepositoryBinding,
@@ -37,6 +38,7 @@ export interface ExecutionProfile {
   flowCommand: string;
   workspaceCommand: string;
   timeoutMs: number;
+  executionPolicy: ExecutionPolicy;
   environment: Record<string, string>;
   metadata: Record<string, unknown>;
   createdAt: string;

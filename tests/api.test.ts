@@ -17,6 +17,40 @@ afterEach(() => {
 });
 
 describe("HTTP API", () => {
+  it("returns a normalized execution policy for legacy profile payloads", async () => {
+    const store = new SqliteStore(":memory:");
+    stores.push(store);
+    const app = buildServer(new CoreService({
+      store,
+      flowExecutor: new CompletedFlow(),
+      clock: new SystemClock(),
+      ids: new UuidGenerator()
+    }));
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/execution-profiles",
+      payload: { name: "legacy-local" }
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(response.json().data.executionPolicy).toEqual({
+      contractVersion: 1,
+      capacity: {
+        global: 4,
+        perProject: 4,
+        perRepository: 2,
+        perBackend: 4
+      },
+      admission: {
+        writablePerRepository: 1,
+        queueDiscipline: "fifo",
+        requireDistinctWorkspace: true
+      }
+    });
+    await app.close();
+  });
+
   it("returns structured validation errors", async () => {
     const store = new SqliteStore(":memory:");
     stores.push(store);
