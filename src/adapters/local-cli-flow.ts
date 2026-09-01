@@ -26,6 +26,15 @@ interface FlowInvokeEnvelope {
   eventLogUri?: string;
 }
 
+interface FlowCommandEnvelope {
+  contractVersion: number;
+  command: string;
+  status: "success" | "error";
+  runId: string;
+  data?: Record<string, unknown>;
+  error?: { code: string; message: string; details?: Record<string, unknown> };
+}
+
 function parseInvokeJson(stdout: string, processExitCode: number): FlowStartResult {
   let envelope: FlowInvokeEnvelope;
   try {
@@ -74,6 +83,32 @@ function parseInvokeJson(stdout: string, processExitCode: number): FlowStartResu
       eventLogUri: envelope.eventLogUri ?? null
     }
   };
+}
+
+function assertCommandJson(stdout: string, processExitCode: number, command: string): void {
+  let envelope: FlowCommandEnvelope;
+  try {
+    envelope = JSON.parse(stdout) as FlowCommandEnvelope;
+  } catch {
+    throw new IntegrationError(`zigma-flow ${command} --json output could not be parsed as JSON`, {
+      stdoutTail: stdout.slice(-4_000),
+      exitCode: processExitCode
+    });
+  }
+  if (envelope.contractVersion !== 1) {
+    throw new IntegrationError(
+      `zigma-flow ${command} contract version mismatch: expected 1, got ${String(envelope.contractVersion)}`,
+      { contractVersion: envelope.contractVersion, expectedVersion: 1 }
+    );
+  }
+  if (processExitCode !== 0 || envelope.status !== "success") {
+    throw new IntegrationError(envelope.error?.message ?? `zigma-flow ${command} command failed`, {
+      exitCode: processExitCode,
+      providerCode: envelope.error?.code,
+      details: envelope.error?.details,
+      runId: envelope.runId
+    });
+  }
 }
 
 /** Exported for testing */
@@ -161,33 +196,32 @@ export class LocalCliFlowExecutor implements FlowExecutor {
     for (const [key, value] of Object.entries(request.input)) {
       args.push("--input", `${key}=${typeof value === "string" ? value : JSON.stringify(value)}`);
     }
+    args.push("--json");
     const result = await execa(request.command, args, {
       reject: false,
       all: true,
       timeout: request.timeoutMs,
       env: { ...process.env, ...request.environment }
     });
-    if ((result.exitCode ?? 1) !== 0) {
-      throw new IntegrationError("zigma-flow rejected the human gate decision", {
-        exitCode: result.exitCode,
-        output: result.all?.slice(-4_000)
-      });
-    }
+    assertCommandJson(result.stdout ?? result.all ?? "", result.exitCode ?? 1, "resume");
   }
 
   async cancel(request: FlowCancelRequest): Promise<void> {
-    const result = await execa(request.command, ["--cwd", request.projectRoot, "abort", request.externalRunId], {
+    const result = await execa(request.command, [
+      "--cwd",
+      request.projectRoot,
+      "abort",
+      "--run",
+      request.externalRunId,
+      "--reason",
+      request.reason,
+      "--json"
+    ], {
       reject: false,
       all: true,
       timeout: request.timeoutMs,
-      env: { ...process.env, ...request.environment, ZIGMA_CORE_CANCEL_REASON: request.reason }
+      env: { ...process.env, ...request.environment }
     });
-    if ((result.exitCode ?? 1) !== 0) {
-      throw new IntegrationError("zigma-flow could not cancel the run", {
-        externalRunId: request.externalRunId,
-        exitCode: result.exitCode,
-        output: result.all?.slice(-4_000)
-      });
-    }
+    assertCommandJson(result.stdout ?? result.all ?? "", result.exitCode ?? 1, "abort");
   }
 }

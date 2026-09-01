@@ -22,6 +22,17 @@ function jsonEnvelope(overrides: Record<string, unknown> = {}): string {
   });
 }
 
+function commandEnvelope(command: "resume" | "abort", overrides: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    contractVersion: 1,
+    command,
+    status: "success",
+    runId: "run-1",
+    data: {},
+    ...overrides
+  });
+}
+
 function defaultRequest(overrides: Record<string, unknown> = {}) {
   return {
     command: "zigma-flow",
@@ -247,5 +258,85 @@ describe("buildContextFilePayload", () => {
     expect(payload.permissionSnapshotId).toBeNull();
     expect(payload.integrityHash).toBeNull();
     expect(payload.coreCallbackUrl).toBeUndefined();
+  });
+});
+
+describe("LocalCliFlowExecutor command contracts", () => {
+  const executor = new LocalCliFlowExecutor();
+
+  it("uses the versioned resume JSON command for gate decisions", async () => {
+    mockExeca.mockResolvedValueOnce({
+      stdout: commandEnvelope("resume"),
+      all: commandEnvelope("resume"),
+      exitCode: 0
+    });
+
+    await executor.decideGate({
+      command: "zigma-flow",
+      externalRunId: "run-1",
+      jobId: "job-1",
+      decision: "approve",
+      input: {},
+      projectRoot: "/tmp/project",
+      timeoutMs: 60_000,
+      environment: {}
+    });
+
+    expect(mockExeca.mock.lastCall?.[1]).toEqual([
+      "--cwd",
+      "/tmp/project",
+      "resume",
+      "run-1",
+      "--job",
+      "job-1",
+      "--input",
+      "decision=approve",
+      "--json"
+    ]);
+  });
+
+  it("uses abort --run with a structured reason and JSON response", async () => {
+    mockExeca.mockResolvedValueOnce({
+      stdout: commandEnvelope("abort"),
+      all: commandEnvelope("abort"),
+      exitCode: 0
+    });
+
+    await executor.cancel({
+      command: "zigma-flow",
+      externalRunId: "run-1",
+      projectRoot: "/tmp/project",
+      reason: "user-requested",
+      timeoutMs: 60_000,
+      environment: {}
+    });
+
+    expect(mockExeca.mock.lastCall?.[1]).toEqual([
+      "--cwd",
+      "/tmp/project",
+      "abort",
+      "--run",
+      "run-1",
+      "--reason",
+      "user-requested",
+      "--json"
+    ]);
+  });
+
+  it("rejects an unsupported abort command contract version", async () => {
+    mockExeca.mockResolvedValueOnce({
+      stdout: commandEnvelope("abort", { contractVersion: 2 }),
+      all: commandEnvelope("abort", { contractVersion: 2 }),
+      exitCode: 0
+    });
+
+    await expect(executor.cancel({
+      command: "zigma-flow",
+      externalRunId: "run-1",
+      projectRoot: "/tmp/project",
+      reason: "user-requested",
+      timeoutMs: 60_000,
+      environment: {}
+    })).rejects.toThrow("zigma-flow abort contract version mismatch: expected 1, got 2");
   });
 });
