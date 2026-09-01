@@ -95,7 +95,8 @@ export class CoreService {
       this.store.insertExecutionProfile(profile);
       this.audit("execution-profile", profile.id, "execution-profile.created", SYSTEM_ACTOR, {
         name: profile.name,
-        mode: profile.mode
+        mode: profile.mode,
+        executionPolicy: profile.executionPolicy
       });
     });
     return profile;

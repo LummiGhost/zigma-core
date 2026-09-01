@@ -37,10 +37,34 @@ Registers how Core invokes `zigma-flow` and `zigma-workspace`.
   "flowCommand": "zigma-flow",
   "workspaceCommand": "zigma-workspace",
   "timeoutMs": 3600000,
+  "executionPolicy": {
+    "contractVersion": 1,
+    "capacity": {
+      "global": 4,
+      "perProject": 4,
+      "perRepository": 2,
+      "perBackend": 4
+    },
+    "admission": {
+      "writablePerRepository": 1,
+      "queueDiscipline": "fifo",
+      "requireDistinctWorkspace": true
+    }
+  },
   "environment": {},
   "metadata": {}
 }
 ```
+
+`executionPolicy` is normalized on create and is always present in API and CLI
+responses. All capacity values are finite positive integers. Omitted fields use
+the values shown above. `writablePerRepository` cannot exceed
+`capacity.perRepository`; the current contract supports FIFO admission and
+requires a distinct Workspace for every writable task attempt.
+
+These fields publish the M0 admission contract. Enforcement and durable
+capacity leases are delivered by M2; the synchronous MVP records the policy but
+does not yet queue competing tasks.
 
 ### `GET /execution-profiles/:id`
 

@@ -1,5 +1,9 @@
 import { DatabaseSync } from "node:sqlite";
-import type { ActorRef } from "../contracts/schemas.js";
+import {
+  DEFAULT_EXECUTION_POLICY,
+  ExecutionPolicySchema,
+  type ActorRef
+} from "../contracts/schemas.js";
 import type {
   AuditEvent,
   EvidenceBundle,
@@ -66,6 +70,7 @@ export class SqliteStore {
         flow_command TEXT NOT NULL,
         workspace_command TEXT NOT NULL,
         timeout_ms INTEGER NOT NULL,
+        execution_policy_json TEXT NOT NULL,
         environment_json TEXT NOT NULL,
         metadata_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -248,6 +253,11 @@ export class SqliteStore {
       CREATE INDEX IF NOT EXISTS idx_evidence_items_bundle ON evidence_items(bundle_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_audit_aggregate ON audit_events(aggregate_type, aggregate_id, created_at);
     `);
+    const profileColumns = this.db.prepare("PRAGMA table_info(execution_profiles)").all() as Array<{ name: string }>;
+    if (!profileColumns.some((column) => column.name === "execution_policy_json")) {
+      const defaultPolicy = toJson(DEFAULT_EXECUTION_POLICY).replaceAll("'", "''");
+      this.db.exec(`ALTER TABLE execution_profiles ADD COLUMN execution_policy_json TEXT NOT NULL DEFAULT '${defaultPolicy}'`);
+    }
     const decisionColumns = this.db.prepare("PRAGMA table_info(human_decisions)").all() as Array<{ name: string }>;
     if (!decisionColumns.some((column) => column.name === "delivery_status")) {
       this.db.exec("ALTER TABLE human_decisions ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'delivered'");
@@ -265,14 +275,15 @@ export class SqliteStore {
     try {
       this.db.prepare(`INSERT INTO execution_profiles (
         id, name, mode, flow_command, workspace_command, timeout_ms,
-        environment_json, metadata_json, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        execution_policy_json, environment_json, metadata_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         profile.id,
         profile.name,
         profile.mode,
         profile.flowCommand,
         profile.workspaceCommand,
         profile.timeoutMs,
+        toJson(profile.executionPolicy),
         toJson(profile.environment),
         toJson(profile.metadata),
         profile.createdAt,
@@ -293,6 +304,9 @@ export class SqliteStore {
       flowCommand: String(row["flow_command"]),
       workspaceCommand: String(row["workspace_command"]),
       timeoutMs: Number(row["timeout_ms"]),
+      executionPolicy: ExecutionPolicySchema.parse(
+        fromJson(row["execution_policy_json"], DEFAULT_EXECUTION_POLICY)
+      ),
       environment: fromJson(row["environment_json"], {}),
       metadata: fromJson(row["metadata_json"], {}),
       createdAt: String(row["created_at"]),
