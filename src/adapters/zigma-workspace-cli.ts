@@ -9,11 +9,17 @@ import type {
 import { IntegrationError } from "../domain/errors.js";
 
 interface WorkspaceEnvelope<T> {
+  contract_version: number;
   ok: boolean;
   data?: T;
-  error?: string;
-  details?: unknown;
+  error?: {
+    code: string;
+    message: string;
+    details?: Record<string, unknown>;
+  };
 }
+
+const WORKSPACE_CONTRACT_VERSION = 1;
 
 async function invoke<T>(context: WorkspaceInvocationContext, args: string[]): Promise<T> {
   const result = await execa(context.command, [...args, "--json"], {
@@ -34,12 +40,22 @@ async function invoke<T>(context: WorkspaceInvocationContext, args: string[]): P
       output: output.slice(-4_000)
     });
   }
-  if ((result.exitCode ?? 1) !== 0 || !envelope.ok || !envelope.data) {
-    throw new IntegrationError(envelope.error ?? "zigma-workspace command failed", {
+  if (envelope.contract_version !== WORKSPACE_CONTRACT_VERSION) {
+    throw new IntegrationError(
+      `zigma-workspace contract version mismatch: expected ${WORKSPACE_CONTRACT_VERSION}, got ${String(envelope.contract_version)}`,
+      {
+        contractVersion: envelope.contract_version,
+        expectedVersion: WORKSPACE_CONTRACT_VERSION
+      }
+    );
+  }
+  if ((result.exitCode ?? 1) !== 0 || !envelope.ok || envelope.data === undefined) {
+    throw new IntegrationError(envelope.error?.message ?? "zigma-workspace command failed", {
       command: context.command,
       args,
       exitCode: result.exitCode,
-      details: envelope.details
+      providerCode: envelope.error?.code,
+      details: envelope.error?.details
     });
   }
   return envelope.data;
@@ -72,7 +88,9 @@ export class ZigmaWorkspaceCliAdapter implements WorkspaceProvider {
       "--task",
       request.taskId,
       "--flow-run",
-      request.flowRunId
+      request.flowRunId,
+      "--operation-id",
+      `core:workspace:create:${request.flowRunId}`
     ]);
     return {
       provider: "zigma-workspace-cli",
@@ -99,7 +117,9 @@ export class ZigmaWorkspaceCliAdapter implements WorkspaceProvider {
       "--task",
       taskId,
       "--flow-run",
-      flowRunId
+      flowRunId,
+      "--operation-id",
+      `core:workspace:bind:${flowRunId}`
     ]);
   }
 
@@ -155,6 +175,18 @@ export class ZigmaWorkspaceCliAdapter implements WorkspaceProvider {
   }
 
   async cleanup(externalWorkspaceId: string, context: WorkspaceInvocationContext): Promise<void> {
-    await invoke(context, ["cleanup", "--workspace", externalWorkspaceId]);
+    const result = await invoke<{
+      workspace_id: string;
+      path: string;
+      removed: boolean;
+      message: string;
+    }>(context, ["cleanup", "--workspace", externalWorkspaceId]);
+    if (!result.removed) {
+      throw new IntegrationError("zigma-workspace did not confirm physical cleanup", {
+        workspaceId: externalWorkspaceId,
+        path: result.path,
+        message: result.message
+      });
+    }
   }
 }

@@ -5,6 +5,7 @@ Version: 0.1
 ## Architecture decisions
 
 - [ADR-0001: Parallel Development Execution Contract](adr/0001-parallel-development-execution-contract.md)
+- [Cross-repository compatibility matrix and contract-test plan](compatibility-matrix.md)
 
 ADR-0001 defines the published language, bounded-context ownership, invariants,
 quality scenarios, and staged migration that govern parallel task execution

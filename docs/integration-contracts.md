@@ -1,145 +1,74 @@
-# Zigma Component Integration Contracts
+# Zigma 组件集成契约
 
-Version: 0.1
+版本：1.0
 
-## 1. Contract priority
+本文记录 Core 侧的集成边界。精确最低版本、命令、envelope、capability、
+provider/consumer tests 和 rollout 规则见
+[跨仓兼容矩阵](compatibility-matrix.md)。组件所有者的完整语义分别记录在：
 
-Zigma Core defines the platform-facing contracts for task execution. Component adapters can translate current CLI behavior, but the target contracts should be implemented directly by the component that owns each capability.
+- Core：[ADR-0001](adr/0001-parallel-development-execution-contract.md)
+- Flow：`zigma-flow/docs/platform-integration-contract.md`
+- Workspace：`zigma-workspace/docs/platform-integration-contract.md`
 
-## 2. zigma-flow contract
+## 1. 契约优先级
 
-### 2.1 Start request
+1. 组件所有者定义其状态机和 side-effect truth。
+2. 版本化 machine envelope 是跨进程事实；人类可读日志不是协议。
+3. Core adapter 是 anti-corruption layer，负责版本拒绝、字段校验和投影。
+4. Core 的兼容矩阵决定一个组件组合是否可 admission。
+5. 未通过 provider/consumer contract tests 的能力不能仅凭包版本启用。
 
-Core requires a workflow invocation contract equivalent to:
+## 2. 所有权
 
-```ts
-interface FlowStartRequest {
-  taskId: string;
-  flowRunId: string;
-  workflowRef: string;
-  taskText: string;
-  projectRoot: string;
-  inputs: Record<string, string>;
-  callerContext: CallerContext;
-  timeoutMs: number;
-  dryRun: boolean;
-}
-```
+| 能力 | 权威所有者 | Core 中的记录 |
+| --- | --- | --- |
+| Workflow DAG、job/step/attempt/run state | Zigma Flow | Flow Run projection |
+| Flow event log 和 runtime artifact | Zigma Flow | Evidence URI 和 audit projection |
+| Git worktree、workspace path、lock/lease、cleanup | Zigma Workspace | Workspace Ref 和 cleanup projection |
+| Task、admission、capacity、permission、human decision | Zigma Core | 对应 Core aggregate |
+| Artifact bytes | 生产组件或 artifact store | content-addressed Evidence Item |
 
-The MVP adapter maps this to:
+Core 不修改 Flow runtime state，不通过目录扫描替代 Workspace 对账，也不从
+provider process exit code 单独推断 terminal/cleaned 状态。
 
-```bash
-zigma-flow --cwd <workspace> invoke <workflow> \
-  --task <description> \
-  --input zigma_core_task_id=<id> \
-  --input zigma_core_flow_run_id=<id>
-```
+## 3. 当前 adapter 表面
 
-### 2.2 Required machine result
+### Flow
 
-Target result:
+`LocalCliFlowExecutor` 使用：
 
-```json
-{
-  "contractVersion": 1,
-  "runId": "...",
-  "status": "completed",
-  "exitCode": 0,
-  "pausedGate": null,
-  "artifacts": [],
-  "eventLogUri": "file:///.../events.jsonl"
-}
-```
+- `invoke --json --context-file`，校验 `contractVersion: 1`、run ID 和 status；
+- `resume ... --json` 提交 human gate decision；
+- `abort --run ... --reason ... --json` 记录取消请求。
 
-The current adapter parses the human-readable final line. This is a compatibility bridge and should be removed after `zigma-flow invoke --json` exists.
+Abort 响应不是进程终止证明。可靠取消、事件 delivery 和进程回收由 M1/M2
+补齐。
 
-### 2.3 Event delivery
+### Workspace
 
-Core accepts idempotent events at:
+`ZigmaWorkspaceCliAdapter` 使用：
 
-```text
-POST /v1/flow-runs/:coreFlowRunId/events
-```
+- `create`、`bind-run`、`diff`、`snapshot` 和基础 `cleanup`；
+- 对所有响应校验 `contract_version: 1`；
+- create/bind 使用由 Core flow run 派生的稳定 operation id；
+- cleanup 只有在 `removed: true` 时返回成功。
 
-Every event requires a stable `eventId`, `occurredAt`, and event type. Delivery can be at-least-once because Core deduplicates event IDs.
+Heartbeat、reconcile、integration lock 和 strict cleanup 在 M3 暴露 stable CLI
+前不能作为 Core 跨进程依赖。
 
-A future execution mode can provide one of these mechanisms:
+## 4. 共同规则
 
-- `--event-sink <url>`
-- `--event-file <path>` plus a Core watcher
-- Library callback
-- Service API stream
+- 相同 operation/command id 与相同输入表示同一逻辑操作；不同输入必须冲突。
+- timeout 表示结果未知，触发 reconciliation，不表示失败或取消已完成。
+- unknown contract version/capability 必须在 side effect 前 fail closed。
+- stdout 只承载 JSON/NDJSON；诊断日志走 stderr。
+- `file:` artifact URI 仅在同一宿主有效；跨宿主传递必须进入 artifact store。
+- writable attempt 必须拥有独立 Workspace path；manifest 不是 OS sandbox。
+- cleanup 只有在目录与 Git registration 都确认移除后才是事实终态。
 
-### 2.4 Human Gate
+## 5. 演进规则
 
-When a human step pauses, Flow should expose:
-
-- Stable external gate ID
-- Run ID
-- Job ID
-- Step ID
-- Prompt
-- Input JSON Schema
-- Deadline, when configured
-- Artifact references relevant to the decision
-
-Core returns a decision through a resume contract. The current CLI adapter uses `resume <run-id> --job <job-id> --input ...`.
-
-### 2.5 Context transport
-
-Large or sensitive Caller Context values should use a file or structured API payload. Repeated `--input` arguments remain suitable for identifiers and small non-secret values.
-
-Target CLI option:
-
-```bash
-zigma-flow invoke <workflow> --context-file <path>
-```
-
-The file should contain the permission snapshot ID, integrity hash, capabilities, constraints, task source, and Core callback information.
-
-## 3. zigma-workspace contract
-
-The current `zigma-workspace` MVP already provides a usable JSON CLI envelope:
-
-```json
-{
-  "ok": true,
-  "data": {}
-}
-```
-
-Core uses:
-
-- `create --json`
-- `bind-run --json`
-- `diff --json`
-- `snapshot --json`
-- `cleanup --json`
-
-### 3.1 Stability requirements
-
-The JSON contract should add:
-
-- `contract_version`
-- Stable machine error code
-- `operation_id` for idempotent retries
-- Optional `state_dir` override for isolated deployments
-- Documented path and URI semantics across Windows and POSIX systems
-
-### 3.2 Library API
-
-A future package export should expose the same operations through TypeScript interfaces. Core can then use the library adapter for an in-process deployment while retaining the CLI adapter for process isolation.
-
-## 4. Ownership matrix
-
-| Capability | Owner | Core record |
-|---|---|---|
-| Workflow DAG | zigma-flow | Workflow reference |
-| Job and step state | zigma-flow | Flow status projection |
-| Git worktree | zigma-workspace | Workspace Ref |
-| Task lifecycle | zigma-core | Task |
-| Authorization decision | zigma-core | Permission Snapshot |
-| Human approval | zigma-core | Human Gate and Decision |
-| Artifact bytes | Flow, Workspace, object store | Evidence Item URI |
-| Platform audit | zigma-core | Audit Event |
-| PR and review platform | future zigma-code | External reference |
+新增可选字段和错误码可以保持主契约版本；删除字段、改变语义、幂等边界或
+状态含义需要提高主版本。Provider 先发布向后兼容能力，Core 再通过 capability
+协商启用。Rollback 先停止新 admission，等待/取消并 reconcile active work，
+不得让新旧 dispatch mode 同时处理同一 command。
