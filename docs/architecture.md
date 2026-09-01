@@ -2,6 +2,14 @@
 
 Version: 0.1
 
+## Architecture decisions
+
+- [ADR-0001: Parallel Development Execution Contract](adr/0001-parallel-development-execution-contract.md)
+
+ADR-0001 defines the published language, bounded-context ownership, invariants,
+quality scenarios, and staged migration that govern parallel task execution
+across Zigma Core, Zigma Flow, and Zigma Workspace.
+
 ## 1. Responsibility boundary
 
 Zigma Core is the Zigma control plane. It owns durable platform state and coordination across long-lived tasks.
