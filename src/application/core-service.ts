@@ -25,10 +25,12 @@ import type {
   AuditEvent,
   EvidenceBundle,
   EvidenceItem,
+  ExecutionCommand,
   ExecutionProfile,
   FlowRun,
   HumanDecision,
   HumanGate,
+  OutboxDelivery,
   PermissionSnapshot,
   Project,
   Task,
@@ -61,6 +63,7 @@ export interface TaskView {
   flowRuns: FlowRun[];
   activeFlowRun?: FlowRun;
   workspace?: WorkspaceRef;
+  executionCommand?: ExecutionCommand;
   evidence?: {
     bundle: EvidenceBundle;
     items: EvidenceItem[];
@@ -188,6 +191,9 @@ export class CoreService {
     const workspace = activeFlowRun?.workspaceId
       ? this.store.getWorkspace(activeFlowRun.workspaceId)
       : undefined;
+    const executionCommand = activeFlowRun
+      ? this.store.getExecutionCommandForRun(activeFlowRun.id)
+      : undefined;
     let evidence: TaskView["evidence"];
     if (activeFlowRun) {
       try {
@@ -203,6 +209,7 @@ export class CoreService {
       flowRuns,
       ...(activeFlowRun ? { activeFlowRun } : {}),
       ...(workspace ? { workspace } : {}),
+      ...(executionCommand ? { executionCommand } : {}),
       ...(evidence ? { evidence } : {})
     };
   }
@@ -223,6 +230,28 @@ export class CoreService {
       throw new ConflictError("Repository is not bound to the project", { projectId: project.id, repositoryId });
     }
     this.assertConstraints(input, workflowRef, repositoryId);
+
+    const baseRef = input.baseRef ?? repository.defaultRef;
+    const branch = input.branch ?? project.workspacePolicy.branchTemplate.replaceAll("{taskId}", task.id).replaceAll("{projectKey}", project.key);
+    const commandInput = {
+      taskId: task.id, projectId: project.id, workflowRef, repositoryId,
+      repositoryUrl: repository.url, baseRef, branch, inputs: input.inputs,
+      backend: input.backend ?? "default", parallelism: input.parallelism,
+      dryRun: input.dryRun, callerContext: input.callerContext,
+      workspacePolicy: project.workspacePolicy
+    };
+    const inputHash = stableHash(commandInput);
+    if (input.idempotencyKey) {
+      const existing = this.store.findExecutionCommandByIdempotencyKey(task.id, input.idempotencyKey);
+      if (existing) {
+        if (existing.inputHash !== inputHash) {
+          throw new ConflictError("Idempotency key was already used with different execution input", {
+            taskId: task.id, idempotencyKey: input.idempotencyKey, executionCommandId: existing.id
+          });
+        }
+        return this.getTaskView(task.id);
+      }
+    }
 
     if (!["created", "failed", "blocked"].includes(task.status)) {
       throw new ConflictError("Task cannot be started from its current status", {
@@ -278,6 +307,23 @@ export class CoreService {
       createdAt: now,
       updatedAt: now
     };
+    const commandId = this.ids.next("command");
+    const executionCommand: ExecutionCommand = {
+      id: commandId,
+      operationId: commandId,
+      ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+      inputHash, taskId: task.id, flowRunId: flowRun.id, projectId: project.id,
+      repositoryId, repositoryUrl: repository.url, baseRef,
+      backend: input.backend ?? "default", workspacePolicy: project.workspacePolicy,
+      permissionSnapshotId: permissionSnapshot.id, callbackCorrelationId: commandId,
+      status: "pending", attempt: 0, payload: commandInput, createdAt: now, updatedAt: now
+    };
+    const outbox: OutboxDelivery = {
+      id: this.ids.next("outbox"), topic: "execution-command.requested",
+      aggregateId: commandId,
+      payload: { commandId, operationId: commandId, flowRunId: flowRun.id, taskId: task.id },
+      status: "pending", attempt: 0, availableAt: now, createdAt: now, updatedAt: now
+    };
 
     this.store.transaction(() => {
       task = this.transitionTask(task, "queued", input.callerContext.actor);
@@ -286,6 +332,8 @@ export class CoreService {
       this.store.insertPermissionSnapshot(permissionSnapshot);
       this.store.insertFlowRun(flowRun);
       this.store.insertEvidenceBundle(bundle);
+      this.store.insertExecutionCommand(executionCommand);
+      this.store.insertOutboxDelivery(outbox);
       this.audit("flow-run", flowRun.id, "flow-run.created", input.callerContext.actor, {
         taskId: task.id,
         workflowRef,
@@ -297,9 +345,6 @@ export class CoreService {
     let workspace: WorkspaceRef | undefined;
     try {
       task = this.transitionTask(this.store.getTask(task.id), "provisioning", input.callerContext.actor);
-      const branch = input.branch ?? project.workspacePolicy.branchTemplate.replaceAll("{taskId}", task.id).replaceAll("{projectKey}", project.key);
-      const baseRef = input.baseRef ?? repository.defaultRef;
-
       if (project.workspacePolicy.provider !== "none") {
         if (!this.workspaceProvider) {
           throw new IntegrationError("Project requires a workspace provider, but none is configured", {
@@ -392,6 +437,8 @@ export class CoreService {
       });
 
       this.applyFlowResult(flowRun.id, result, input.callerContext.actor);
+      const completedAt = this.clock.now();
+      this.store.updateExecutionCommand({ ...executionCommand, status: "completed", attempt: 1, updatedAt: completedAt, completedAt });
       try {
         await this.collectWorkspaceEvidence(flowRun.id, profile);
       } catch (evidenceError) {
@@ -421,6 +468,8 @@ export class CoreService {
           });
         }
       }
+      const failedAt = this.clock.now();
+      this.store.updateExecutionCommand({ ...executionCommand, status: "failed", attempt: 1, lastError: message, updatedAt: failedAt, completedAt: failedAt });
       throw error instanceof IntegrationError
         ? error
         : new IntegrationError("Failed to start task execution", { taskId: task.id, cause: message });

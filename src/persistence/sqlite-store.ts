@@ -8,12 +8,14 @@ import type {
   AuditEvent,
   EvidenceBundle,
   EvidenceItem,
+  ExecutionCommand,
   ExecutionProfile,
   FlowRun,
   HumanDecision,
   HumanGate,
   PermissionSnapshot,
   Project,
+  OutboxDelivery,
   Task,
   WorkspaceRef
 } from "../domain/models.js";
@@ -146,6 +148,45 @@ export class SqliteStore {
         completed_at TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS execution_commands (
+        id TEXT PRIMARY KEY,
+        operation_id TEXT NOT NULL UNIQUE,
+        idempotency_key TEXT,
+        input_hash TEXT NOT NULL,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        flow_run_id TEXT NOT NULL UNIQUE REFERENCES flow_runs(id),
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        repository_id TEXT NOT NULL,
+        repository_url TEXT NOT NULL,
+        base_ref TEXT NOT NULL,
+        backend TEXT NOT NULL,
+        workspace_policy_json TEXT NOT NULL,
+        permission_snapshot_id TEXT NOT NULL REFERENCES permission_snapshots(id),
+        callback_correlation_id TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL,
+        attempt INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        UNIQUE(task_id, idempotency_key)
+      );
+
+      CREATE TABLE IF NOT EXISTS outbox_deliveries (
+        id TEXT PRIMARY KEY,
+        topic TEXT NOT NULL,
+        aggregate_id TEXT NOT NULL REFERENCES execution_commands(id),
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempt INTEGER NOT NULL,
+        available_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        delivered_at TEXT,
+        last_error TEXT
+      );
+
       CREATE TABLE IF NOT EXISTS workspaces (
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -248,6 +289,8 @@ export class SqliteStore {
 
       CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_flow_runs_task ON flow_runs(task_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_execution_commands_status ON execution_commands(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox_deliveries(status, available_at, created_at);
       CREATE INDEX IF NOT EXISTS idx_gates_status ON human_gates(status, created_at);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_human_decisions_gate ON human_decisions(gate_id);
       CREATE INDEX IF NOT EXISTS idx_evidence_items_bundle ON evidence_items(bundle_id, created_at);
@@ -496,6 +539,89 @@ export class SqliteStore {
       run.updatedAt,
       run.completedAt ?? null
     );
+  }
+
+  insertExecutionCommand(command: ExecutionCommand): void {
+    this.db.prepare(`INSERT INTO execution_commands (
+      id, operation_id, idempotency_key, input_hash, task_id, flow_run_id,
+      project_id, repository_id, repository_url, base_ref, backend,
+      workspace_policy_json, permission_snapshot_id, callback_correlation_id,
+      status, attempt, payload_json, last_error, created_at, updated_at, completed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      command.id, command.operationId, command.idempotencyKey ?? null, command.inputHash,
+      command.taskId, command.flowRunId, command.projectId, command.repositoryId,
+      command.repositoryUrl, command.baseRef, command.backend, toJson(command.workspacePolicy),
+      command.permissionSnapshotId, command.callbackCorrelationId, command.status,
+      command.attempt, toJson(command.payload), command.lastError ?? null, command.createdAt,
+      command.updatedAt, command.completedAt ?? null
+    );
+  }
+
+  getExecutionCommand(id: string): ExecutionCommand {
+    const row = this.db.prepare("SELECT * FROM execution_commands WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    if (!row) throw new NotFoundError("execution command", id);
+    return this.mapExecutionCommand(row);
+  }
+
+  getExecutionCommandForRun(flowRunId: string): ExecutionCommand | undefined {
+    const row = this.db.prepare("SELECT * FROM execution_commands WHERE flow_run_id = ?").get(flowRunId) as Record<string, unknown> | undefined;
+    return row ? this.mapExecutionCommand(row) : undefined;
+  }
+
+  findExecutionCommandByIdempotencyKey(taskId: string, key: string): ExecutionCommand | undefined {
+    const row = this.db.prepare("SELECT * FROM execution_commands WHERE task_id = ? AND idempotency_key = ?").get(taskId, key) as Record<string, unknown> | undefined;
+    return row ? this.mapExecutionCommand(row) : undefined;
+  }
+
+  updateExecutionCommand(command: ExecutionCommand): void {
+    this.db.prepare(`UPDATE execution_commands SET status = ?, attempt = ?, payload_json = ?,
+      last_error = ?, updated_at = ?, completed_at = ? WHERE id = ?`).run(
+      command.status, command.attempt, toJson(command.payload), command.lastError ?? null,
+      command.updatedAt, command.completedAt ?? null, command.id
+    );
+  }
+
+  private mapExecutionCommand(row: Record<string, unknown>): ExecutionCommand {
+    return {
+      id: String(row["id"]), operationId: String(row["operation_id"]),
+      ...(optionalString(row["idempotency_key"]) ? { idempotencyKey: optionalString(row["idempotency_key"]) } : {}),
+      inputHash: String(row["input_hash"]), taskId: String(row["task_id"]),
+      flowRunId: String(row["flow_run_id"]), projectId: String(row["project_id"]),
+      repositoryId: String(row["repository_id"]), repositoryUrl: String(row["repository_url"]),
+      baseRef: String(row["base_ref"]), backend: String(row["backend"]),
+      workspacePolicy: fromJson(row["workspace_policy_json"], { provider: "none", mode: "read-only", branchTemplate: "zigma/{taskId}", cleanup: "manual", snapshotOnTerminal: false }),
+      permissionSnapshotId: String(row["permission_snapshot_id"]),
+      callbackCorrelationId: String(row["callback_correlation_id"]),
+      status: row["status"] as ExecutionCommand["status"], attempt: Number(row["attempt"]),
+      payload: fromJson(row["payload_json"], {}),
+      ...(optionalString(row["last_error"]) ? { lastError: optionalString(row["last_error"]) } : {}),
+      createdAt: String(row["created_at"]), updatedAt: String(row["updated_at"]),
+      ...(optionalString(row["completed_at"]) ? { completedAt: optionalString(row["completed_at"]) } : {})
+    };
+  }
+
+  insertOutboxDelivery(delivery: OutboxDelivery): void {
+    this.db.prepare(`INSERT INTO outbox_deliveries (
+      id, topic, aggregate_id, payload_json, status, attempt, available_at,
+      created_at, updated_at, delivered_at, last_error
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      delivery.id, delivery.topic, delivery.aggregateId, toJson(delivery.payload), delivery.status,
+      delivery.attempt, delivery.availableAt, delivery.createdAt, delivery.updatedAt,
+      delivery.deliveredAt ?? null, delivery.lastError ?? null
+    );
+  }
+
+  listOutboxDeliveries(): OutboxDelivery[] {
+    const rows = this.db.prepare("SELECT * FROM outbox_deliveries ORDER BY created_at ASC").all() as Record<string, unknown>[];
+    return rows.map((row) => ({
+      id: String(row["id"]), topic: row["topic"] as OutboxDelivery["topic"],
+      aggregateId: String(row["aggregate_id"]), payload: fromJson(row["payload_json"], {}),
+      status: row["status"] as OutboxDelivery["status"], attempt: Number(row["attempt"]),
+      availableAt: String(row["available_at"]), createdAt: String(row["created_at"]),
+      updatedAt: String(row["updated_at"]),
+      ...(optionalString(row["delivered_at"]) ? { deliveredAt: optionalString(row["delivered_at"]) } : {}),
+      ...(optionalString(row["last_error"]) ? { lastError: optionalString(row["last_error"]) } : {})
+    }));
   }
 
   getFlowRun(id: string): FlowRun {

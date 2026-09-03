@@ -184,6 +184,7 @@ export const CreateTaskInputSchema = z.object({
 export type CreateTaskInput = z.infer<typeof CreateTaskInputSchema>;
 
 export const StartTaskInputSchema = z.object({
+  idempotencyKey: z.string().min(1).max(256).optional(),
   callerContext: CallerContextSchema,
   workflowRef: z.string().min(1).optional(),
   repositoryId: IdSchema.optional(),
