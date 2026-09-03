@@ -49,12 +49,18 @@ export interface WorkspaceProvider {
 }
 
 export interface FlowStartRequest {
+  /** Stable Core operation identity used by Flow/Workspace for idempotent provider calls. */
+  operationId?: string;
+  callbackCorrelationId?: string;
   command: string;
   taskId: string;
   flowRunId: string;
   workflowRef: string;
   taskText: string;
   projectRoot: string;
+  repository?: RepositoryBinding;
+  baseRef?: string;
+  workspacePolicy?: WorkspacePolicy;
   inputs: Record<string, string>;
   callerContext: CallerContext;
   /** ID of the PermissionSnapshot stored in Core. Sent via --context-file so zigma-flow can cross-reference. */

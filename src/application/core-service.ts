@@ -55,6 +55,7 @@ export interface CoreServiceDependencies {
   workspaceProvider?: WorkspaceProvider;
   clock: Clock;
   ids: IdGenerator;
+  executionMode?: "synchronous" | "asynchronous";
 }
 
 export interface TaskView {
@@ -76,6 +77,7 @@ export class CoreService {
   private readonly workspaceProvider?: WorkspaceProvider;
   private readonly clock: Clock;
   private readonly ids: IdGenerator;
+  private readonly executionMode: "synchronous" | "asynchronous";
 
   constructor(dependencies: CoreServiceDependencies) {
     this.store = dependencies.store;
@@ -83,6 +85,7 @@ export class CoreService {
     this.workspaceProvider = dependencies.workspaceProvider;
     this.clock = dependencies.clock;
     this.ids = dependencies.ids;
+    this.executionMode = dependencies.executionMode ?? "synchronous";
   }
 
   createExecutionProfile(raw: CreateExecutionProfileInput): ExecutionProfile {
@@ -342,6 +345,10 @@ export class CoreService {
       }, task.id);
     });
 
+    if (this.executionMode === "asynchronous") {
+      return this.getTaskView(task.id);
+    }
+
     let workspace: WorkspaceRef | undefined;
     try {
       task = this.transitionTask(this.store.getTask(task.id), "provisioning", input.callerContext.actor);
@@ -411,12 +418,17 @@ export class CoreService {
 
       const projectRoot = workspace?.path ?? String(project.metadata["projectRoot"] ?? process.cwd());
       const result = await this.flowExecutor.start({
+        operationId: executionCommand.operationId,
+        callbackCorrelationId: executionCommand.callbackCorrelationId,
         command: profile.flowCommand,
         taskId: task.id,
         flowRunId: flowRun.id,
         workflowRef,
         taskText: task.description,
         projectRoot,
+        repository,
+        baseRef,
+        workspacePolicy: project.workspacePolicy,
         inputs: {
           ...input.inputs,
           zigma_core_task_id: task.id,
@@ -473,6 +485,109 @@ export class CoreService {
       throw error instanceof IntegrationError
         ? error
         : new IntegrationError("Failed to start task execution", { taskId: task.id, cause: message });
+    }
+  }
+
+  async dispatchExecutionCommand(commandId: string): Promise<TaskView> {
+    let command = this.store.getExecutionCommand(commandId);
+    if (["completed", "cancelled"].includes(command.status)) return this.getTaskView(command.taskId);
+    const task = this.store.getTask(command.taskId);
+    const project = this.store.getProject(command.projectId);
+    const profile = this.store.getExecutionProfile(project.executionProfileId);
+    const run = this.store.getFlowRun(command.flowRunId);
+    const permissionSnapshot = this.store.getPermissionSnapshot(command.permissionSnapshotId);
+    const payload = command.payload as {
+      workflowRef: string; branch: string; inputs: Record<string, string>;
+      parallelism?: number; dryRun: boolean; callerContext: StartTaskInput["callerContext"];
+    };
+    let workspace: WorkspaceRef | undefined;
+    try {
+      let currentTask = task;
+      if (currentTask.status === "blocked") currentTask = this.transitionTask(currentTask, "queued", payload.callerContext.actor);
+      if (currentTask.status === "queued") this.transitionTask(currentTask, "provisioning", payload.callerContext.actor);
+      command = { ...command, attempt: command.attempt + 1, updatedAt: this.clock.now() };
+      this.store.updateExecutionCommand(command);
+      if (command.workspacePolicy.provider !== "none") {
+        if (!this.workspaceProvider) throw new IntegrationError("Project requires a workspace provider, but none is configured");
+        const repository = project.repositories.find((candidate) => candidate.id === command.repositoryId);
+        if (!repository) throw new ConflictError("Repository is not bound to the project", { repositoryId: command.repositoryId });
+        const prepared = await this.workspaceProvider.prepare({
+          projectId: project.id, taskId: task.id, flowRunId: run.id, repository,
+          baseRef: command.baseRef, branch: payload.branch, policy: command.workspacePolicy,
+          command: profile.workspaceCommand, timeoutMs: profile.timeoutMs, environment: profile.environment
+        });
+        const workspaceNow = this.clock.now();
+        workspace = {
+          id: this.ids.next("workspace"), taskId: task.id, flowRunId: run.id,
+          provider: prepared.provider, externalId: prepared.externalId, path: prepared.path,
+          repositoryUrl: prepared.repositoryUrl, baseRef: prepared.baseRef, baseCommit: prepared.baseCommit,
+          branch: prepared.branch, mode: prepared.mode, status: "active", metadata: prepared.metadata,
+          createdAt: workspaceNow, updatedAt: workspaceNow
+        };
+        this.store.transaction(() => {
+          this.store.insertWorkspace(workspace!);
+          this.store.updateFlowRun({ ...this.store.getFlowRun(run.id), workspaceId: workspace!.id, updatedAt: workspaceNow });
+        });
+        await this.workspaceProvider.bindRun?.(prepared.externalId, task.id, run.id, {
+          command: profile.workspaceCommand, timeoutMs: profile.timeoutMs, environment: profile.environment
+        });
+      }
+      const startedAt = this.clock.now();
+      const currentRun = this.store.getFlowRun(run.id);
+      if (currentRun.status === "created") {
+        this.store.updateFlowRun({ ...currentRun, status: "starting", startedAt, updatedAt: startedAt });
+      }
+      const taskBeforeInvoke = this.store.getTask(task.id);
+      if (taskBeforeInvoke.status === "provisioning") this.transitionTask(taskBeforeInvoke, "running", payload.callerContext.actor);
+      this.store.updateExecutionCommand({ ...command, status: "dispatched", updatedAt: startedAt });
+      const result = await this.flowExecutor.start({
+        operationId: command.operationId, callbackCorrelationId: command.callbackCorrelationId,
+        command: profile.flowCommand, taskId: task.id, flowRunId: run.id,
+        workflowRef: payload.workflowRef, taskText: task.description,
+        projectRoot: workspace?.path ?? String(project.metadata["projectRoot"] ?? process.cwd()),
+        repository: project.repositories.find((candidate) => candidate.id === command.repositoryId),
+        baseRef: command.baseRef, workspacePolicy: command.workspacePolicy,
+        inputs: { ...payload.inputs, zigma_core_task_id: task.id, zigma_core_flow_run_id: run.id,
+          zigma_core_permission_snapshot_id: permissionSnapshot.id,
+          zigma_core_permission_snapshot_hash: permissionSnapshot.hash,
+          ...(workspace ? { zigma_workspace_id: workspace.externalId } : {}) },
+        callerContext: payload.callerContext, permissionSnapshotId: permissionSnapshot.id,
+        integrityHash: permissionSnapshot.hash,
+        coreCallbackUrl: process.env["ZIGMA_CORE_URL"] ?? "http://127.0.0.1:4736/v1",
+        ...(command.backend !== "default" ? { backend: command.backend } : {}),
+        ...(payload.parallelism !== undefined ? { parallelism: payload.parallelism } : {}),
+        timeoutMs: payload.callerContext.constraints.maxRunDurationMs ?? profile.timeoutMs,
+        environment: profile.environment, dryRun: payload.dryRun
+      });
+      this.applyFlowResult(run.id, result, payload.callerContext.actor);
+      const completedAt = this.clock.now();
+      this.store.updateExecutionCommand({ ...this.store.getExecutionCommand(command.id), status: "completed", updatedAt: completedAt, completedAt });
+      try { await this.collectWorkspaceEvidence(run.id, profile); }
+      catch (error) { this.markEvidenceCollectionIncomplete(run.id, task.id, error instanceof Error ? error.message : String(error)); }
+      return this.getTaskView(task.id);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const failedAt = this.clock.now();
+      const latestCommand = this.store.getExecutionCommand(command.id);
+      const currentRun = this.store.getFlowRun(run.id);
+      const currentTask = this.store.getTask(task.id);
+      if (latestCommand.status === "leased" && latestCommand.attempt < 3) {
+        if (currentTask.status === "provisioning") this.transitionTask(currentTask, "blocked", SYSTEM_ACTOR, undefined, { retryable: true, attempt: latestCommand.attempt });
+        this.store.updateExecutionCommand({ ...latestCommand, status: "pending", lastError: message, updatedAt: failedAt });
+        throw error;
+      }
+      if (latestCommand.status === "dispatched") {
+        if (currentTask.status === "running") this.transitionTask(currentTask, "blocked", SYSTEM_ACTOR, undefined, { reconciliationRequired: true });
+        this.store.updateExecutionCommand({ ...latestCommand, status: "reconciling", lastError: message, updatedAt: failedAt });
+        throw error;
+      }
+      if (!["completed", "failed", "cancelled"].includes(currentRun.status)) {
+        this.store.updateFlowRun({ ...currentRun, status: "failed", error: { code: "DISPATCH_FAILED", message, details: {} }, updatedAt: failedAt, completedAt: failedAt });
+        const refreshedTask = this.store.getTask(task.id);
+        if (!["completed", "failed", "cancelled"].includes(refreshedTask.status)) this.transitionTask(refreshedTask, "failed", SYSTEM_ACTOR, { code: "DISPATCH_FAILED", message, details: {} });
+      }
+      this.store.updateExecutionCommand({ ...latestCommand, status: "failed", lastError: message, updatedAt: failedAt, completedAt: failedAt });
+      throw error;
     }
   }
 
@@ -791,6 +906,7 @@ export class CoreService {
     }
     if (task.activeFlowRunId) {
       const run = this.store.getFlowRun(task.activeFlowRunId);
+      const command = this.store.getExecutionCommandForRun(run.id);
       if (run.externalRunId && this.flowExecutor.cancel) {
         const workspace = run.workspaceId ? this.store.getWorkspace(run.workspaceId) : undefined;
         const profile = this.store.getExecutionProfile(run.executionProfileId);
@@ -807,6 +923,9 @@ export class CoreService {
         const now = this.clock.now();
         assertFlowTransition(run.status, "cancelled");
         this.store.updateFlowRun({ ...run, status: "cancelled", updatedAt: now, completedAt: now });
+        if (command && !["completed", "failed", "cancelled"].includes(command.status)) {
+          this.store.updateExecutionCommand({ ...command, status: "cancelled", updatedAt: now, completedAt: now });
+        }
       }
     }
     return this.transitionTask(task, "cancelled", actor, undefined, { reason });

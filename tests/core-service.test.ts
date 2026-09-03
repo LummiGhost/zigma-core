@@ -14,6 +14,7 @@ import type {
 } from "../src/contracts/ports.js";
 import { CoreService } from "../src/application/core-service.js";
 import { ExecutionAdmissionService } from "../src/application/execution-admission.js";
+import { AsyncExecutionRuntime } from "../src/application/async-execution-runtime.js";
 import type { DecideHumanGateInput } from "../src/contracts/schemas.js";
 import { SqliteStore } from "../src/persistence/sqlite-store.js";
 import { ConflictError, ForbiddenError } from "../src/domain/errors.js";
@@ -37,6 +38,7 @@ class FakeIds implements IdGenerator {
 class FakeFlow implements FlowExecutor {
   readonly decisions: FlowGateDecisionRequest[] = [];
   starts = 0;
+  startBarrier?: Promise<void>;
   decisionError?: Error;
   result: FlowStartResult = {
     externalRunId: "zf-run-1",
@@ -48,6 +50,7 @@ class FakeFlow implements FlowExecutor {
 
   async start(_request: FlowStartRequest): Promise<FlowStartResult> {
     this.starts += 1;
+    await this.startBarrier;
     return this.result;
   }
 
@@ -95,16 +98,19 @@ afterEach(() => {
   for (const store of stores.splice(0)) store.close();
 });
 
-function setup(options?: { workspaceProvider?: WorkspaceProvider }) {
+function setup(options?: { workspaceProvider?: WorkspaceProvider; executionMode?: "synchronous" | "asynchronous" }) {
   const store = new SqliteStore(":memory:");
   stores.push(store);
   const flow = new FakeFlow();
+  const clock = new FakeClock();
+  const ids = new FakeIds();
   const core = new CoreService({
     store,
     flowExecutor: flow,
     workspaceProvider: options?.workspaceProvider ?? new FakeWorkspace(),
-    clock: new FakeClock(),
-    ids: new FakeIds()
+    clock,
+    ids,
+    executionMode: options?.executionMode
   });
   const profile = core.createExecutionProfile({
     name: "local",
@@ -150,7 +156,7 @@ function setup(options?: { workspaceProvider?: WorkspaceProvider }) {
     labels: ["mvp"],
     metadata: {}
   });
-  return { core, flow, store, project, task };
+  return { core, flow, store, project, task, clock, ids };
 }
 
 function startInput() {
@@ -179,6 +185,82 @@ function startInput() {
 }
 
 describe("CoreService", () => {
+  it("returns accepted durable intent before background Flow execution and recovers it after restart", async () => {
+    const { core, flow, store, project, task, clock, ids } = setup({ executionMode: "asynchronous" });
+    let releaseFlow!: () => void;
+    flow.startBarrier = new Promise<void>((resolve) => { releaseFlow = resolve; });
+
+    const accepted = await core.startTask(task.id, { ...startInput(), idempotencyKey: "async-start" });
+    expect(accepted.task.status).toBe("queued");
+    expect(accepted.activeFlowRun?.status).toBe("created");
+    expect(accepted.executionCommand?.status).toBe("pending");
+    expect(flow.starts).toBe(0);
+
+    const restartedCore = new CoreService({
+      store, flowExecutor: flow, workspaceProvider: new FakeWorkspace(),
+      clock, ids, executionMode: "asynchronous"
+    });
+    const runtime = new AsyncExecutionRuntime(
+      store, restartedCore,
+      new ExecutionAdmissionService(store, clock, ids),
+      {
+        ownerId: "worker-after-restart",
+        policyFor: () => store.getExecutionProfile(project.executionProfileId).executionPolicy
+      }
+    );
+    const dispatch = runtime.runOnce();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(flow.starts).toBe(1);
+    expect(store.getExecutionCommand(accepted.executionCommand!.id).status).toBe("dispatched");
+    releaseFlow();
+    expect(await dispatch).toBe(1);
+    expect(core.getTaskView(task.id)).toMatchObject({
+      task: { status: "completed" }, executionCommand: { status: "completed", attempt: 1 }
+    });
+    expect(store.getExecutionLease(accepted.executionCommand!.id)?.status).toBe("released");
+  });
+
+  it("cancels queued durable intent before a worker can invoke Flow", async () => {
+    const { core, flow, store, project, task, clock, ids } = setup({ executionMode: "asynchronous" });
+    const accepted = await core.startTask(task.id, { ...startInput(), idempotencyKey: "cancel-before-dispatch" });
+
+    await core.cancelTask(task.id, "no longer needed");
+    const runtime = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+      ownerId: "worker-cancel-test",
+      policyFor: () => store.getExecutionProfile(project.executionProfileId).executionPolicy
+    });
+
+    expect(await runtime.runOnce()).toBe(0);
+    expect(flow.starts).toBe(0);
+    expect(store.getExecutionCommand(accepted.executionCommand!.id).status).toBe("cancelled");
+    expect(core.getTask(task.id).status).toBe("cancelled");
+  });
+
+  it("retries bounded pre-invocation failures without duplicating Flow", async () => {
+    class FlakyWorkspace extends FakeWorkspace {
+      attempts = 0;
+      async prepare(request: WorkspacePreparationRequest): Promise<PreparedWorkspace> {
+        this.attempts += 1;
+        if (this.attempts < 3) throw new Error("workspace temporarily unavailable");
+        return super.prepare(request);
+      }
+    }
+    const workspace = new FlakyWorkspace();
+    const { core, flow, store, project, task, clock, ids } = setup({ executionMode: "asynchronous", workspaceProvider: workspace });
+    const accepted = await core.startTask(task.id, { ...startInput(), idempotencyKey: "bounded-retry" });
+    const runtime = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+      ownerId: "worker-retry-test",
+      policyFor: () => store.getExecutionProfile(project.executionProfileId).executionPolicy
+    });
+
+    expect(await runtime.runOnce()).toBe(0);
+    expect(await runtime.runOnce()).toBe(0);
+    expect(await runtime.runOnce()).toBe(1);
+    expect(workspace.attempts).toBe(3);
+    expect(flow.starts).toBe(1);
+    expect(store.getExecutionCommand(accepted.executionCommand!.id)).toMatchObject({ status: "completed", attempt: 3 });
+  });
+
   it("atomically limits admission across 20 queued commands", async () => {
     const { core, store, project, task } = setup();
     const tasks = [task];

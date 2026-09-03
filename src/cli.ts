@@ -3,6 +3,8 @@ import { mkdir, readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { Command } from "commander";
 import { CoreService } from "./application/core-service.js";
+import { AsyncExecutionRuntime } from "./application/async-execution-runtime.js";
+import { ExecutionAdmissionService } from "./application/execution-admission.js";
 import { SystemClock, UuidGenerator } from "./application/runtime.js";
 import { LocalCliFlowExecutor } from "./adapters/local-cli-flow.js";
 import { ZigmaWorkspaceCliAdapter } from "./adapters/zigma-workspace-cli.js";
@@ -13,18 +15,21 @@ async function readJson(path: string): Promise<unknown> {
   return JSON.parse(await readFile(resolve(path), "utf8")) as unknown;
 }
 
-async function openCore(dbPath: string): Promise<{ core: CoreService; store: SqliteStore }> {
+async function openCore(dbPath: string, executionMode: "synchronous" | "asynchronous" = "synchronous"): Promise<{ core: CoreService; store: SqliteStore; clock: SystemClock; ids: UuidGenerator }> {
   const resolved = resolve(dbPath);
   await mkdir(dirname(resolved), { recursive: true });
   const store = new SqliteStore(resolved);
+  const clock = new SystemClock();
+  const ids = new UuidGenerator();
   const core = new CoreService({
     store,
     flowExecutor: new LocalCliFlowExecutor(),
     workspaceProvider: new ZigmaWorkspaceCliAdapter(),
-    clock: new SystemClock(),
-    ids: new UuidGenerator()
+    clock,
+    ids,
+    executionMode
   });
-  return { core, store };
+  return { core, store, clock, ids };
 }
 
 function print(value: unknown): void {
@@ -45,8 +50,18 @@ async function main(): Promise<void> {
     .option("--host <host>", "Bind host", "127.0.0.1")
     .option("--port <port>", "Bind port", "4736")
     .action(async (options: { host: string; port: string }) => {
-      const { core } = await openCore(program.opts<{ db: string }>().db);
+      const { core, store, clock, ids } = await openCore(program.opts<{ db: string }>().db, "asynchronous");
+      const runtime = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+        ownerId: `core-${process.pid}`,
+        policyFor(commandId) {
+          const command = store.getExecutionCommand(commandId);
+          const project = store.getProject(command.projectId);
+          return store.getExecutionProfile(project.executionProfileId).executionPolicy;
+        }
+      });
       const app = buildServer(core);
+      app.addHook("onClose", async () => { await runtime.stop(); store.close(); });
+      runtime.start();
       await app.listen({ host: options.host, port: Number(options.port) });
     });
 
