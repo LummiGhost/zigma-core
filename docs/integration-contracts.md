@@ -41,8 +41,13 @@ provider process exit code 单独推断 terminal/cleaned 状态。
 - `resume ... --json` 提交 human gate decision；
 - `abort --run ... --reason ... --json` 记录取消请求。
 
-Abort 响应不是进程终止证明。可靠取消、事件 delivery 和进程回收由 M1/M2
-补齐。
+Abort 响应不是进程终止证明。M2 execution lease 只在 dispatch 调用返回后释放；
+超时或结果不确定的 invocation 进入 `reconciling`，不盲目重跑或提前 cleanup。
+
+Flow callback 可带 `operationId`、`callbackCorrelationId`、managed Run/Job-attempt
+workspace handle 和 evidence。Core 校验 correlation、按 event id 幂等消费并投影
+handle/evidence；Flow 仍是 Job/attempt 状态权威，Workspace 仍是 worktree、快照、
+reconcile 和 cleanup 权威。
 
 ### Workspace
 

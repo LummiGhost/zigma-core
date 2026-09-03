@@ -122,6 +122,26 @@ export interface WorkspaceRef {
   releasedAt?: string;
 }
 
+export interface ProviderWorkspaceHandle {
+  id: string;
+  flowRunId: string;
+  provider: string;
+  externalId: string;
+  scope: "run" | "job-attempt";
+  jobId?: string;
+  attempt?: number;
+  status: string;
+  path?: string;
+  repositoryUrl?: string;
+  baseRef?: string;
+  baseCommit?: string;
+  branch?: string;
+  metadata: Record<string, unknown>;
+  lastEventId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface FlowRun {
   id: string;
   taskId: string;

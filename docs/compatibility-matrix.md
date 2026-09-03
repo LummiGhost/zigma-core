@@ -1,8 +1,8 @@
 # Zigma 跨仓兼容矩阵与契约测试计划
 
-- 基线名称：`m0-sync-v1`
-- 状态：M0 接受基线
-- 日期：2026-09-01
+- 基线名称：`core-durable-v1`
+- 状态：M2 接受基线（保留 `m0-sync-v1` 回滚模式）
+- 日期：2026-09-03
 - 所有者：Zigma Core
 - 父里程碑：[zigma-core#9](https://github.com/LummiGhost/zigma-core/issues/9)
 
@@ -47,8 +47,8 @@ Core adapter 可使用的能力，不提前声称 durable execution、可靠事�
 | Level | 解锁条件 | 所属里程碑 | 当前状态 |
 | --- | --- | --- | --- |
 | `m0-sync-v1` | 本文的同步命令、版本校验和消费方测试 | M0 | 接受 |
-| `flow-reliable-v1` | 取消后子进程/写入器静默、确定性并行、可靠终态 | [Flow M1 #297](https://github.com/LummiGhost/zigma-flow/issues/297) | 未实现 |
-| `core-durable-v1` | durable command/outbox、容量 lease、at-least-once callback/reconcile | [Core M2 #10](https://github.com/LummiGhost/zigma-core/issues/10) | 未实现 |
+| `flow-reliable-v1` | 取消后子进程/写入器静默、确定性并行、可靠终态 | [Flow M1 #297](https://github.com/LummiGhost/zigma-flow/issues/297) | 已接受（PR #304–#306） |
+| `core-durable-v1` | durable command/outbox、容量 lease、at-least-once callback/reconcile | [Core M2 #10](https://github.com/LummiGhost/zigma-core/issues/10) | 已接受（PR #22–本 PR） |
 | `workspace-isolated-v1` | 强制路径边界、stable lease/reconcile/strict cleanup CLI | [Workspace M3 #27](https://github.com/LummiGhost/zigma-workspace/issues/27) | 未实现 |
 | `parallel-e2e-v1` | 多任务 golden/failure/soak 全部通过 | [Core M4 #11](https://github.com/LummiGhost/zigma-core/issues/11) | 未实现 |
 
@@ -181,12 +181,17 @@ closed。重复清理已清理 workspace 也可能得到该结果；M0 宁可要
 | Flow invoke v1 envelope | Flow `tests/commands/invoke-json.test.ts` | Core `tests/adapters/local-cli-flow.test.ts` | process exit/JSON 对齐：M1 `invoke-terminal-contract.test.ts` |
 | Flow context file | Flow `tests/commands/context-file.test.ts` | Core `buildContextFilePayload` tests | secrets/large payload + real CLI：M2 `flow-context-adapter.contract.test.ts` |
 | Flow resume/abort command | Flow `tests/commands/resume-json.test.ts`, `abort-json.test.ts` | Core `LocalCliFlowExecutor command contracts` | out-of-process termination ack：M1/M2 `abort-process-tree.contract.test.ts` |
-| Flow platform events | Flow `tests/events/platformEvent.test.ts` | 无 M0 consumer；M0 不启用 | M2 `flow-event-consumer.contract.test.ts`，依赖 M1 delivery evidence |
+| Flow platform events | Flow `tests/events/platformEvent.test.ts` | Core `tests/core-service.test.ts` correlated callback/dedupe cases | M4 增加真实跨进程投递 soak |
 | Workspace envelope/create/bind | Workspace types plus `tests/core/workspace-dogfood.test.ts` real Git behavior | Core `tests/adapters/zigma-workspace-cli.test.ts` | CLI black-box provider：M3 `tests/cli/platform-contract.test.ts` |
 | Workspace diff/snapshot | Workspace `tests/core/diff.test.ts`, `workspace-dogfood.test.ts` | Core Workspace adapter test fixture；真实 CLI consumer 尚缺 | M2/M3 `workspace-evidence.contract.test.ts` |
 | Workspace lock/lease/reconcile | Workspace `tests/core/contracts.test.ts`, `contracts-windows.test.ts` | 无 M0 consumer；M0 不启用 | M3 `workspace-lease-adapter.contract.test.ts` |
 | Workspace factual cleanup | Workspace `contracts.test.ts`, `contracts-windows.test.ts` | Core cleanup `removed` fail-closed tests | stable strict CLI：M3 `workspace-cleanup.contract.test.ts` |
-| Core profile policy v1 | Core `tests/execution-profile-policy.test.ts`, `tests/api.test.ts` | Core API/CLI clients | M2 admission integration：`capacity-admission.integration.test.ts` |
+| Core profile policy v1 | Core `tests/execution-profile-policy.test.ts`, `tests/api.test.ts` | Core API/CLI clients | Core 20-command admission、fencing、restart/retry tests |
+
+M2 测试入口目前集中在 `tests/core-service.test.ts`，覆盖 durable transaction
+rollback、幂等冲突、20-command/capacity-4、stale fencing、异步返回、重启拾取、
+排队取消、有限安全重试、callback 冲突/乱序和 Job-attempt workspace evidence
+投影。M4 再把同一组断言提升为三仓真实 CLI golden/soak。
 
 “当前测试”必须在 owning repository CI 中运行。计划测试名是验收入口，不得在
 实现时改成无法追踪的泛化测试而不更新本矩阵。
@@ -201,7 +206,7 @@ closed。重复清理已清理 workspace 也可能得到该结果；M0 宁可要
 - `parallel-cancel-soak.test.ts`: 并行 job、timeout、fail-fast、cancel 混合重复运行。
 - 现有 `runAll-events` 和 `run-all-parallel` 必须在 full suite 中无共享目录/时序 race。
 
-### M2 — Core durable execution
+### M2 — Core durable execution（已通过）
 
 - `capacity-admission.integration.test.ts`: global/project/repository/backend 原子预留。
 - `command-idempotency.crashpoints.test.ts`: persistence/invoke/ack 每个 crash point。
@@ -291,3 +296,13 @@ closed。重复清理已清理 workspace 也可能得到该结果；M0 宁可要
 
 M0 关闭只表示契约、最低组合、测试所有权和后续 gates 已明确。真正的多任务
 并行开发能力仍需 M1–M4 全部完成。
+
+## 10. M2 关闭证据
+
+- Durable command/outbox 与 idempotency：Core PR #22。
+- 原子多级容量与 fencing lease：Core PR #23。
+- 异步 worker、重启恢复、有限安全重试与取消：Core PR #24。
+- Correlated callback、workspace handle/evidence projection：本 PR。
+
+`core-durable-v1` 只解锁 Core 的可靠调度能力。强 workspace 隔离仍必须等待
+`workspace-isolated-v1`；完整并行开发承诺仍必须等待 `parallel-e2e-v1`。

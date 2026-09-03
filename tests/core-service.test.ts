@@ -218,6 +218,7 @@ describe("CoreService", () => {
       task: { status: "completed" }, executionCommand: { status: "completed", attempt: 1 }
     });
     expect(store.getExecutionLease(accepted.executionCommand!.id)?.status).toBe("released");
+    expect(store.listOutboxDeliveries()).toEqual([expect.objectContaining({ status: "delivered", attempt: 1 })]);
   });
 
   it("cancels queued durable intent before a worker can invoke Flow", async () => {
@@ -432,6 +433,48 @@ describe("CoreService", () => {
       payload: {}
     });
     expect(duplicate.task.status).toBe("completed");
+  });
+
+  it("deduplicates correlated callbacks and projects job workspace evidence without owning job state", async () => {
+    const { core, task } = setup();
+    const started = await core.startTask(task.id, { ...startInput(), idempotencyKey: "callback-projection" });
+    const run = started.activeFlowRun!;
+    const command = started.executionCommand!;
+    const event = {
+      eventId: "workspace-event-1",
+      operationId: command.operationId,
+      callbackCorrelationId: command.callbackCorrelationId,
+      type: "run.progress" as const,
+      occurredAt: "2026-07-20T02:00:00.000Z",
+      workspace: {
+        provider: "zigma-workspace", externalId: "ws-job-build-2", scope: "job-attempt" as const,
+        jobId: "build", attempt: 2, status: "snapshotted", path: "/tmp/job-build-2",
+        repositoryUrl: "https://github.com/LummiGhost/zigma-core.git", baseRef: "main",
+        baseCommit: "abc123", branch: "zigma/job-build-2", metadata: { workspaceCapability: "managed-v1" }
+      },
+      evidence: [{ kind: "workspace-snapshot" as const, name: "job-build-2-snapshot", uri: "artifact://sha256/123", digest: "sha256:123", metadata: { jobId: "build", attempt: 2 } }],
+      payload: { sequence: 7 }
+    };
+
+    const projected = core.recordFlowEvent(run.id, event);
+    const duplicate = core.recordFlowEvent(run.id, event);
+    expect(duplicate.workspaceHandles).toEqual(projected.workspaceHandles);
+    expect(projected.workspaceHandles).toEqual([expect.objectContaining({
+      externalId: "ws-job-build-2", scope: "job-attempt", jobId: "build", attempt: 2,
+      status: "snapshotted", lastEventId: "workspace-event-1"
+    })]);
+    expect(projected.evidence?.items.filter((item) => item.name === "job-build-2-snapshot")).toHaveLength(1);
+
+    expect(() => core.recordFlowEvent(run.id, { ...event, payload: { sequence: 8 } })).toThrow(ConflictError);
+    expect(() => core.recordFlowEvent(run.id, { ...event, eventId: "bad-correlation", callbackCorrelationId: "wrong" })).toThrow(ConflictError);
+
+    const stale = core.recordFlowEvent(run.id, {
+      eventId: "late-started", operationId: command.operationId,
+      callbackCorrelationId: command.callbackCorrelationId, type: "run.started",
+      occurredAt: "2026-07-20T01:00:00.000Z", payload: {}
+    });
+    expect(stale.task.status).toBe("completed");
+    expect(stale.activeFlowRun?.status).toBe("completed");
   });
 
   it("keeps failed human gate delivery retryable and finalizes it after retry", async () => {
