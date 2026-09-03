@@ -98,7 +98,18 @@ afterEach(() => {
   for (const store of stores.splice(0)) store.close();
 });
 
-function setup(options?: { workspaceProvider?: WorkspaceProvider; executionMode?: "synchronous" | "asynchronous" }) {
+function setup(options?: {
+  workspaceProvider?: WorkspaceProvider;
+  executionMode?: "synchronous" | "asynchronous";
+  repositoryWritable?: boolean;
+  workspacePolicy?: {
+    provider: "zigma-workspace-cli" | "existing-directory" | "none";
+    mode: "writable" | "read-only";
+    branchTemplate: string;
+    cleanup: "always" | "on-success" | "manual";
+    snapshotOnTerminal: boolean;
+  };
+}) {
   const store = new SqliteStore(":memory:");
   stores.push(store);
   const flow = new FakeFlow();
@@ -130,14 +141,14 @@ function setup(options?: { workspaceProvider?: WorkspaceProvider; executionMode?
         provider: "github",
         url: "https://github.com/LummiGhost/zigma-core.git",
         defaultRef: "main",
-        writable: true,
+        writable: options?.repositoryWritable ?? true,
         metadata: {}
       }
     ],
     defaultRepositoryId: "main",
     defaultWorkflowRef: "code-change",
     executionProfileId: profile.id,
-    workspacePolicy: {
+    workspacePolicy: options?.workspacePolicy ?? {
       provider: "zigma-workspace-cli",
       mode: "writable",
       branchTemplate: "zigma/{taskId}",
@@ -531,6 +542,89 @@ describe("CoreService", () => {
 
     await expect(core.startTask(task.id, input)).rejects.toBeInstanceOf(ForbiddenError);
     expect(core.getTask(task.id).status).toBe("created");
+  });
+
+  it("enforces branch constraints using whole-string globs", async () => {
+    const { core, task } = setup();
+    const input = { ...startInput(), branch: "zigma/release/2026" };
+    input.callerContext.constraints.branchPatterns = ["zigma/*"];
+    await expect(core.startTask(task.id, input)).resolves.toMatchObject({ task: { status: "completed" } });
+
+    const second = setup();
+    const denied = { ...startInput(), branch: "feature/release" };
+    denied.callerContext.constraints.branchPatterns = ["zigma/*"];
+    await expect(second.core.startTask(second.task.id, denied)).rejects.toMatchObject({ code: "FORBIDDEN" });
+  });
+
+  it("rejects writable workspace admission for a read-only repository", async () => {
+    const { core, task } = setup({ repositoryWritable: false });
+    await expect(core.startTask(task.id, startInput())).rejects.toMatchObject({
+      code: "FORBIDDEN",
+      details: { repositoryId: "main" }
+    });
+    expect(core.getTask(task.id).status).toBe("created");
+  });
+
+  it("fails closed for unsupported workspace policy combinations", async () => {
+    const { core, project } = setup();
+    expect(() => core.createProject({
+      key: "unsupported-policy",
+      displayName: "Unsupported policy",
+      repositories: project.repositories,
+      defaultRepositoryId: project.defaultRepositoryId,
+      defaultWorkflowRef: project.defaultWorkflowRef,
+      executionProfileId: project.executionProfileId,
+      workspacePolicy: {
+        provider: "zigma-workspace-cli",
+        mode: "writable",
+        branchTemplate: "zigma/{taskId}",
+        cleanup: "on-success",
+        snapshotOnTerminal: false
+      },
+      metadata: {}
+    })).toThrowError(/snapshotOnTerminal=false/);
+  });
+
+  it("rejects execution profiles whose mode has no wired host", async () => {
+    const { core } = setup();
+    expect(() => core.createExecutionProfile({
+      name: "remote-unwired", mode: "remote-host", flowCommand: "zigma-flow",
+      workspaceCommand: "zigma-workspace", timeoutMs: 60_000, environment: {}, metadata: {}
+    })).toThrowError(/not wired/);
+  });
+
+  it("keeps HumanDecision immutable while appending delivery attempts", async () => {
+    const { core, flow, store, task } = setup();
+    flow.result = { externalRunId: "zf-paused-append-only", status: "awaiting_human", exitCode: 0, metadata: {} };
+    const run = (await core.startTask(task.id, startInput())).activeFlowRun!;
+    const gate = core.createHumanGate({
+      externalGateId: "gate-append-only", taskId: task.id, flowRunId: run.id,
+      jobId: "review", stepId: "approval", prompt: "Approve?", inputSchema: {},
+      allowedApprovers: [{ type: "user", id: "owner" }], metadata: {}
+    });
+    flow.decisionError = new Error("flow unavailable");
+    const decisionInput: DecideHumanGateInput = {
+      actor: { type: "user", id: "owner" }, decision: "approve", input: {},
+      callerCapabilities: ["gate:approve"]
+    };
+    await expect(core.decideHumanGate(gate.id, decisionInput)).rejects.toMatchObject({ code: "INTEGRATION_ERROR" });
+    const immutable = store.db.prepare(
+      "SELECT decision, delivery_status, last_error, created_at, updated_at FROM human_decisions WHERE gate_id = ?"
+    ).get(gate.id) as Record<string, unknown>;
+    flow.decisionError = undefined;
+    await core.decideHumanGate(gate.id, decisionInput);
+    expect(store.db.prepare(
+      "SELECT decision, delivery_status, last_error, created_at, updated_at FROM human_decisions WHERE gate_id = ?"
+    ).get(gate.id)).toEqual(immutable);
+    expect(store.db.prepare(
+      "SELECT attempt, delivery_status FROM human_decision_delivery_attempts WHERE decision_id = ? ORDER BY attempt"
+    ).all(store.getHumanDecision(gate.id)!.id)).toEqual([
+      { attempt: 1, delivery_status: "pending" },
+      { attempt: 2, delivery_status: "failed" },
+      { attempt: 3, delivery_status: "pending" },
+      { attempt: 4, delivery_status: "delivered" }
+    ]);
+    expect(store.getHumanDecision(gate.id)).toMatchObject({ deliveryStatus: "delivered", deliveryAttempt: 4 });
   });
 
   it("completes task when evidence collection fails without affecting task status", async () => {

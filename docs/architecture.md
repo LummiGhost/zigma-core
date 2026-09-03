@@ -129,7 +129,14 @@ A snapshot contains:
 
 Permission changes during a run do not mutate the snapshot. A new authorization decision creates a new task attempt and snapshot.
 
-The current MVP enforces task start, workflow invocation, workspace creation, workspace write, gate approval, and gate rejection capabilities. Tool and branch constraints are carried in the contract and should be enforced by execution hosts and future policy adapters.
+The current MVP enforces task start, workflow invocation, workspace creation, workspace write, gate approval, and gate rejection capabilities. Tool constraints are carried in the contract and should be enforced by execution hosts and future policy adapters.
+
+Core also enforces the caller's branch constraint at start admission. Branch
+patterns use whole-string glob matching (`*` matches any sequence, including
+`/`; `?` matches one character); an empty list means unrestricted. The local
+runtime currently fails closed for unsupported execution profile modes and
+workspace policies rather than treating them as local behavior. M0 supports
+only `local-cli`, `cleanup: "manual"`, and `snapshotOnTerminal: true`.
 
 ## 7. Failure handling
 

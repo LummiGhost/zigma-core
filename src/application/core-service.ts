@@ -50,6 +50,21 @@ import { stableHash } from "./runtime.js";
 
 const SYSTEM_ACTOR = { type: "system", id: "zigma-core" } as const;
 
+function matchesBranchPattern(branch: string, pattern: string): boolean {
+  let expression = "^";
+  for (const character of pattern) {
+    if (character === "*") {
+      expression += ".*";
+    } else if (character === "?") {
+      expression += ".";
+    } else {
+      expression += character.replace(/[\\^$.*+()[\]{}|]/g, "\\$&");
+    }
+  }
+  expression += "$";
+  return new RegExp(expression, "u").test(branch);
+}
+
 export interface CoreServiceDependencies {
   store: SqliteStore;
   flowExecutor: FlowExecutor;
@@ -92,6 +107,7 @@ export class CoreService {
 
   createExecutionProfile(raw: CreateExecutionProfileInput): ExecutionProfile {
     const input = CreateExecutionProfileInputSchema.parse(raw);
+    this.assertSupportedExecutionProfile(input.mode);
     const now = this.clock.now();
     const profile: ExecutionProfile = {
       id: this.ids.next("profile"),
@@ -116,7 +132,9 @@ export class CoreService {
 
   createProject(raw: CreateProjectInput): Project {
     const input = CreateProjectInputSchema.parse(raw);
-    this.store.getExecutionProfile(input.executionProfileId);
+    const profile = this.store.getExecutionProfile(input.executionProfileId);
+    this.assertSupportedExecutionProfile(profile.mode);
+    this.assertSupportedWorkspacePolicy(input.workspacePolicy);
     const now = this.clock.now();
     const project: Project = {
       id: this.ids.next("project"),
@@ -226,6 +244,7 @@ export class CoreService {
     let task = this.store.getTask(taskId);
     const project = this.store.getProject(task.projectId);
     const profile = this.store.getExecutionProfile(project.executionProfileId);
+    this.assertSupportedExecutionProfile(profile.mode);
 
     this.requireCapability(input.callerContext.capabilities, "task:start");
     this.requireCapability(input.callerContext.capabilities, "workflow:invoke");
@@ -237,9 +256,12 @@ export class CoreService {
       throw new ConflictError("Repository is not bound to the project", { projectId: project.id, repositoryId });
     }
     this.assertConstraints(input, workflowRef, repositoryId);
+    this.assertSupportedWorkspacePolicy(project.workspacePolicy);
 
     const baseRef = input.baseRef ?? repository.defaultRef;
     const branch = input.branch ?? project.workspacePolicy.branchTemplate.replaceAll("{taskId}", task.id).replaceAll("{projectKey}", project.key);
+    this.assertBranchAllowed(input.callerContext.constraints.branchPatterns, branch);
+    this.assertWorkspaceModeAllowed(repository, project.workspacePolicy.mode);
     const commandInput = {
       taskId: task.id, projectId: project.id, workflowRef, repositoryId,
       repositoryUrl: repository.url, baseRef, branch, inputs: input.inputs,
@@ -379,6 +401,7 @@ export class CoreService {
           environment: profile.environment
         });
         const workspaceNow = this.clock.now();
+        this.assertPreparedWorkspaceMatchesPolicy(prepared.mode, project.workspacePolicy.mode);
         workspace = {
           id: this.ids.next("workspace"),
           taskId: task.id,
@@ -498,6 +521,7 @@ export class CoreService {
     const task = this.store.getTask(command.taskId);
     const project = this.store.getProject(command.projectId);
     const profile = this.store.getExecutionProfile(project.executionProfileId);
+    this.assertSupportedExecutionProfile(profile.mode);
     const run = this.store.getFlowRun(command.flowRunId);
     const permissionSnapshot = this.store.getPermissionSnapshot(command.permissionSnapshotId);
     const payload = command.payload as {
@@ -506,6 +530,11 @@ export class CoreService {
     };
     let workspace: WorkspaceRef | undefined;
     try {
+      this.assertSupportedWorkspacePolicy(command.workspacePolicy);
+      const repository = project.repositories.find((candidate) => candidate.id === command.repositoryId);
+      if (!repository) throw new ConflictError("Repository is not bound to the project", { repositoryId: command.repositoryId });
+      this.assertBranchAllowed(payload.callerContext.constraints.branchPatterns, payload.branch);
+      this.assertWorkspaceModeAllowed(repository, command.workspacePolicy.mode);
       let currentTask = task;
       if (currentTask.status === "blocked") currentTask = this.transitionTask(currentTask, "queued", payload.callerContext.actor);
       if (currentTask.status === "queued") this.transitionTask(currentTask, "provisioning", payload.callerContext.actor);
@@ -513,14 +542,13 @@ export class CoreService {
       this.store.updateExecutionCommand(command);
       if (command.workspacePolicy.provider !== "none") {
         if (!this.workspaceProvider) throw new IntegrationError("Project requires a workspace provider, but none is configured");
-        const repository = project.repositories.find((candidate) => candidate.id === command.repositoryId);
-        if (!repository) throw new ConflictError("Repository is not bound to the project", { repositoryId: command.repositoryId });
         const prepared = await this.workspaceProvider.prepare({
           projectId: project.id, taskId: task.id, flowRunId: run.id, repository,
           baseRef: command.baseRef, branch: payload.branch, policy: command.workspacePolicy,
           command: profile.workspaceCommand, timeoutMs: profile.timeoutMs, environment: profile.environment
         });
         const workspaceNow = this.clock.now();
+        this.assertPreparedWorkspaceMatchesPolicy(prepared.mode, command.workspacePolicy.mode);
         workspace = {
           id: this.ids.next("workspace"), taskId: task.id, flowRunId: run.id,
           provider: prepared.provider, externalId: prepared.externalId, path: prepared.path,
@@ -1067,6 +1095,58 @@ export class CoreService {
     }
     if (constraints.repositoryIds.length > 0 && !constraints.repositoryIds.includes(repositoryId)) {
       throw new ForbiddenError("Repository is outside the caller context", { repositoryId });
+    }
+  }
+
+  private assertBranchAllowed(patterns: readonly string[], branch: string): void {
+    if (patterns.length > 0 && !patterns.some((pattern) => matchesBranchPattern(branch, pattern))) {
+      throw new ForbiddenError("Branch is outside the caller context", {
+        branch,
+        branchPatterns: [...patterns]
+      });
+    }
+  }
+
+  private assertSupportedExecutionProfile(mode: ExecutionProfile["mode"]): void {
+    if (mode !== "local-cli") {
+      throw new ConflictError("Execution profile mode is not wired in this Core runtime", {
+        mode,
+        supportedModes: ["local-cli"]
+      });
+    }
+  }
+
+  private assertSupportedWorkspacePolicy(policy: Project["workspacePolicy"]): void {
+    if (policy.snapshotOnTerminal !== true) {
+      throw new ConflictError("Workspace policy snapshotOnTerminal=false is not supported safely yet", {
+        snapshotOnTerminal: policy.snapshotOnTerminal
+      });
+    }
+    if (policy.cleanup !== "manual") {
+      throw new ConflictError("Automatic workspace cleanup is not supported safely yet", {
+        cleanup: policy.cleanup,
+        supportedCleanup: "manual"
+      });
+    }
+  }
+
+  private assertWorkspaceModeAllowed(repository: Project["repositories"][number], mode: Project["workspacePolicy"]["mode"]): void {
+    if (mode === "writable" && repository.writable === false) {
+      throw new ForbiddenError("Repository does not permit writable workspaces", {
+        repositoryId: repository.id
+      });
+    }
+  }
+
+  private assertPreparedWorkspaceMatchesPolicy(
+    preparedMode: WorkspaceRef["mode"],
+    requestedMode: WorkspaceRef["mode"]
+  ): void {
+    if (preparedMode !== requestedMode) {
+      throw new IntegrationError("Workspace provider returned a mode different from the requested policy", {
+        requestedMode,
+        preparedMode
+      });
     }
   }
 
