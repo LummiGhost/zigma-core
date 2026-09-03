@@ -32,6 +32,7 @@ import type {
   HumanGate,
   OutboxDelivery,
   PermissionSnapshot,
+  ProviderWorkspaceHandle,
   Project,
   Task,
   TaskStatus,
@@ -65,6 +66,7 @@ export interface TaskView {
   activeFlowRun?: FlowRun;
   workspace?: WorkspaceRef;
   executionCommand?: ExecutionCommand;
+  workspaceHandles: ProviderWorkspaceHandle[];
   evidence?: {
     bundle: EvidenceBundle;
     items: EvidenceItem[];
@@ -197,6 +199,7 @@ export class CoreService {
     const executionCommand = activeFlowRun
       ? this.store.getExecutionCommandForRun(activeFlowRun.id)
       : undefined;
+    const workspaceHandles = activeFlowRun ? this.store.listProviderWorkspaceHandles(activeFlowRun.id) : [];
     let evidence: TaskView["evidence"];
     if (activeFlowRun) {
       try {
@@ -213,6 +216,7 @@ export class CoreService {
       ...(activeFlowRun ? { activeFlowRun } : {}),
       ...(workspace ? { workspace } : {}),
       ...(executionCommand ? { executionCommand } : {}),
+      workspaceHandles,
       ...(evidence ? { evidence } : {})
     };
   }
@@ -594,23 +598,29 @@ export class CoreService {
   recordFlowEvent(flowRunId: string, raw: RecordFlowEventInput): TaskView {
     const input = RecordFlowEventInputSchema.parse(raw);
     const now = this.clock.now();
+    const run = this.store.getFlowRun(flowRunId);
+    const command = this.store.getExecutionCommandForRun(flowRunId);
+    if (input.operationId && input.operationId !== command?.operationId) {
+      throw new ConflictError("Flow event operationId does not match the execution command", { flowRunId, operationId: input.operationId });
+    }
+    if (input.callbackCorrelationId && input.callbackCorrelationId !== command?.callbackCorrelationId) {
+      throw new ConflictError("Flow event callback correlation does not match the execution command", { flowRunId, callbackCorrelationId: input.callbackCorrelationId });
+    }
+    return this.store.transaction(() => {
     const inserted = this.store.insertFlowEvent({
-      id: input.eventId,
-      flowRunId,
-      type: input.type,
-      occurredAt: input.occurredAt,
+      id: input.eventId, flowRunId, type: input.type, occurredAt: input.occurredAt,
       payload: input.payload,
+      inputHash: stableHash({ type: input.type, occurredAt: input.occurredAt, payload: input.payload }),
       createdAt: now
     });
-    if (!inserted) {
-      return this.getTaskView(this.store.getFlowRun(flowRunId).taskId);
-    }
+    if (!inserted) return this.getTaskView(run.taskId);
 
-    const run = this.store.getFlowRun(flowRunId);
     const actor = SYSTEM_ACTOR;
     const targetStatus = this.statusForEvent(input.type, input.status);
     const updatedAt = input.occurredAt;
-    if (targetStatus) {
+    const runIsTerminal = ["completed", "failed", "cancelled"].includes(run.status);
+    const targetIsTerminal = targetStatus ? ["completed", "failed", "cancelled"].includes(targetStatus) : false;
+    if (targetStatus && !(runIsTerminal && !targetIsTerminal)) {
       assertFlowTransition(run.status, targetStatus);
       const terminal = ["completed", "failed", "cancelled"].includes(targetStatus);
       this.store.updateFlowRun({
@@ -623,13 +633,31 @@ export class CoreService {
       });
       this.syncTaskToFlowStatus(run.taskId, targetStatus, actor, input.error);
     }
+    if (input.workspace) {
+      this.store.upsertProviderWorkspaceHandle({
+        id: this.ids.next("workspace-handle"), flowRunId, provider: input.workspace.provider,
+        externalId: input.workspace.externalId, scope: input.workspace.scope,
+        ...(input.workspace.jobId ? { jobId: input.workspace.jobId } : {}),
+        ...(input.workspace.attempt ? { attempt: input.workspace.attempt } : {}),
+        status: input.workspace.status,
+        ...(input.workspace.path ? { path: input.workspace.path } : {}),
+        ...(input.workspace.repositoryUrl ? { repositoryUrl: input.workspace.repositoryUrl } : {}),
+        ...(input.workspace.baseRef ? { baseRef: input.workspace.baseRef } : {}),
+        ...(input.workspace.baseCommit ? { baseCommit: input.workspace.baseCommit } : {}),
+        ...(input.workspace.branch ? { branch: input.workspace.branch } : {}),
+        metadata: input.workspace.metadata, lastEventId: input.eventId, createdAt: now, updatedAt: now
+      });
+    }
+    for (const evidence of input.evidence) this.addEvidenceItem(flowRunId, evidence);
     this.audit("flow-run", flowRunId, input.type, actor, {
       eventId: input.eventId,
       status: targetStatus,
+      ignoredStaleTransition: runIsTerminal && !targetIsTerminal,
       summary: input.summary,
       payload: input.payload
     }, run.taskId, input.eventId);
     return this.getTaskView(run.taskId);
+    });
   }
 
   createHumanGate(raw: CreateHumanGateInput): HumanGate {

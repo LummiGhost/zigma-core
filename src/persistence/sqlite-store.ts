@@ -17,6 +17,7 @@ import type {
   PermissionSnapshot,
   Project,
   OutboxDelivery,
+  ProviderWorkspaceHandle,
   Task,
   WorkspaceRef
 } from "../domain/models.js";
@@ -230,7 +231,29 @@ export class SqliteStore {
         type TEXT NOT NULL,
         occurred_at TEXT NOT NULL,
         payload_json TEXT NOT NULL,
+        event_hash TEXT,
         created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS provider_workspace_handles (
+        id TEXT PRIMARY KEY,
+        flow_run_id TEXT NOT NULL REFERENCES flow_runs(id),
+        provider TEXT NOT NULL,
+        external_id TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        job_id TEXT,
+        attempt INTEGER,
+        status TEXT NOT NULL,
+        path TEXT,
+        repository_url TEXT,
+        base_ref TEXT,
+        base_commit TEXT,
+        branch TEXT,
+        metadata_json TEXT NOT NULL,
+        last_event_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(provider, external_id)
       );
 
       CREATE TABLE IF NOT EXISTS human_gates (
@@ -310,6 +333,7 @@ export class SqliteStore {
       CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox_deliveries(status, available_at, created_at);
       CREATE INDEX IF NOT EXISTS idx_execution_leases_capacity ON execution_leases(status, project_id, repository_url, backend);
       CREATE INDEX IF NOT EXISTS idx_gates_status ON human_gates(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_provider_workspace_run ON provider_workspace_handles(flow_run_id, created_at);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_human_decisions_gate ON human_decisions(gate_id);
       CREATE INDEX IF NOT EXISTS idx_evidence_items_bundle ON evidence_items(bundle_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_audit_aggregate ON audit_events(aggregate_type, aggregate_id, created_at);
@@ -329,6 +353,10 @@ export class SqliteStore {
     if (!decisionColumns.some((column) => column.name === "updated_at")) {
       this.db.exec("ALTER TABLE human_decisions ADD COLUMN updated_at TEXT");
       this.db.exec("UPDATE human_decisions SET updated_at = created_at WHERE updated_at IS NULL");
+    }
+    const eventColumns = this.db.prepare("PRAGMA table_info(flow_events)").all() as Array<{ name: string }>;
+    if (!eventColumns.some((column) => column.name === "event_hash")) {
+      this.db.exec("ALTER TABLE flow_events ADD COLUMN event_hash TEXT");
     }
   }
 
@@ -863,16 +891,66 @@ export class SqliteStore {
     );
   }
 
-  insertFlowEvent(event: { id: string; flowRunId: string; type: string; occurredAt: string; payload: Record<string, unknown>; createdAt: string }): boolean {
-    const result = this.db.prepare(`INSERT OR IGNORE INTO flow_events (id, flow_run_id, type, occurred_at, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)`).run(
+  insertFlowEvent(event: { id: string; flowRunId: string; type: string; occurredAt: string; payload: Record<string, unknown>; inputHash: string; createdAt: string }): boolean {
+    const result = this.db.prepare(`INSERT OR IGNORE INTO flow_events (id, flow_run_id, type, occurred_at, payload_json, event_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
       event.id,
       event.flowRunId,
       event.type,
       event.occurredAt,
       toJson(event.payload),
+      event.inputHash,
       event.createdAt
     );
+    if (result.changes === 0) {
+      const existing = this.db.prepare("SELECT flow_run_id, event_hash FROM flow_events WHERE id = ?").get(event.id) as Record<string, unknown>;
+      if (existing["flow_run_id"] !== event.flowRunId || (existing["event_hash"] && existing["event_hash"] !== event.inputHash)) {
+        throw new ConflictError("Flow event id was reused with different content", { eventId: event.id, flowRunId: event.flowRunId });
+      }
+    }
     return result.changes === 1;
+  }
+
+  markOutboxDeliveredForCommand(commandId: string, now: string): void {
+    this.db.prepare(`UPDATE outbox_deliveries SET status='delivered', attempt=attempt+1,
+      updated_at=?, delivered_at=?, last_error=NULL WHERE aggregate_id=? AND status='pending'`).run(now, now, commandId);
+  }
+
+  upsertProviderWorkspaceHandle(handle: ProviderWorkspaceHandle): ProviderWorkspaceHandle {
+    const existing = this.db.prepare("SELECT * FROM provider_workspace_handles WHERE provider = ? AND external_id = ?").get(handle.provider, handle.externalId) as Record<string, unknown> | undefined;
+    if (existing && existing["flow_run_id"] !== handle.flowRunId) {
+      throw new ConflictError("Provider workspace handle belongs to a different Flow run", { provider: handle.provider, externalId: handle.externalId });
+    }
+    this.db.prepare(`INSERT INTO provider_workspace_handles (
+      id, flow_run_id, provider, external_id, scope, job_id, attempt, status, path,
+      repository_url, base_ref, base_commit, branch, metadata_json, last_event_id, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(provider, external_id) DO UPDATE SET status=excluded.status, path=excluded.path,
+      repository_url=excluded.repository_url, base_ref=excluded.base_ref, base_commit=excluded.base_commit,
+      branch=excluded.branch, metadata_json=excluded.metadata_json, last_event_id=excluded.last_event_id,
+      updated_at=excluded.updated_at`).run(
+      handle.id, handle.flowRunId, handle.provider, handle.externalId, handle.scope,
+      handle.jobId ?? null, handle.attempt ?? null, handle.status, handle.path ?? null,
+      handle.repositoryUrl ?? null, handle.baseRef ?? null, handle.baseCommit ?? null,
+      handle.branch ?? null, toJson(handle.metadata), handle.lastEventId, handle.createdAt, handle.updatedAt
+    );
+    return this.listProviderWorkspaceHandles(handle.flowRunId).find((item) => item.provider === handle.provider && item.externalId === handle.externalId)!;
+  }
+
+  listProviderWorkspaceHandles(flowRunId: string): ProviderWorkspaceHandle[] {
+    const rows = this.db.prepare("SELECT * FROM provider_workspace_handles WHERE flow_run_id = ? ORDER BY created_at ASC").all(flowRunId) as Record<string, unknown>[];
+    return rows.map((row) => ({
+      id: String(row["id"]), flowRunId: String(row["flow_run_id"]), provider: String(row["provider"]), externalId: String(row["external_id"]),
+      scope: row["scope"] as ProviderWorkspaceHandle["scope"],
+      ...(optionalString(row["job_id"]) ? { jobId: optionalString(row["job_id"]) } : {}),
+      ...(optionalNumber(row["attempt"]) !== undefined ? { attempt: optionalNumber(row["attempt"]) } : {}),
+      status: String(row["status"]), ...(optionalString(row["path"]) ? { path: optionalString(row["path"]) } : {}),
+      ...(optionalString(row["repository_url"]) ? { repositoryUrl: optionalString(row["repository_url"]) } : {}),
+      ...(optionalString(row["base_ref"]) ? { baseRef: optionalString(row["base_ref"]) } : {}),
+      ...(optionalString(row["base_commit"]) ? { baseCommit: optionalString(row["base_commit"]) } : {}),
+      ...(optionalString(row["branch"]) ? { branch: optionalString(row["branch"]) } : {}),
+      metadata: fromJson(row["metadata_json"], {}), lastEventId: String(row["last_event_id"]),
+      createdAt: String(row["created_at"]), updatedAt: String(row["updated_at"])
+    }));
   }
 
   insertHumanGate(gate: HumanGate): void {

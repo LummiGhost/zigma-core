@@ -51,6 +51,7 @@ export class AsyncExecutionRuntime {
       for (const command of this.store.listDispatchableExecutionCommands()) {
         const admitted = this.admission.admit(command.id, this.options.ownerId, this.options.policyFor(command.id), this.leaseDurationMs);
         if (admitted.outcome !== "acquired") continue;
+        this.store.markOutboxDeliveredForCommand(command.id, admitted.lease.renewedAt);
         try {
           await this.core.dispatchExecutionCommand(command.id);
           dispatched += 1;

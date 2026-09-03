@@ -210,6 +210,8 @@ export type FlowRunStatus = z.infer<typeof FlowRunStatusSchema>;
 
 export const RecordFlowEventInputSchema = z.object({
   eventId: IdSchema,
+  operationId: IdSchema.optional(),
+  callbackCorrelationId: IdSchema.optional(),
   externalRunId: z.string().min(1).optional(),
   type: z.enum([
     "run.started",
@@ -227,9 +229,37 @@ export const RecordFlowEventInputSchema = z.object({
     message: z.string().min(1),
     details: z.record(z.string(), z.unknown()).default({})
   }).optional(),
+  workspace: z.object({
+    provider: z.string().min(1),
+    externalId: z.string().min(1),
+    scope: z.enum(["run", "job-attempt"]),
+    jobId: z.string().min(1).optional(),
+    attempt: z.number().int().positive().optional(),
+    status: z.string().min(1),
+    path: z.string().min(1).optional(),
+    repositoryUrl: z.string().min(1).optional(),
+    baseRef: z.string().min(1).optional(),
+    baseCommit: z.string().min(1).optional(),
+    branch: z.string().min(1).optional(),
+    metadata: z.record(z.string(), z.unknown()).default({})
+  }).optional(),
+  evidence: z.array(z.object({
+    kind: z.enum(["flow-artifact", "flow-event-log", "validation", "workspace-diff", "workspace-snapshot", "code-change", "pull-request", "ci-result", "human-decision", "summary", "external-link", "other"]),
+    name: z.string().min(1).max(512),
+    uri: z.string().min(1),
+    mediaType: z.string().min(1).max(256).optional(),
+    digest: z.string().min(1).max(256).optional(),
+    sizeBytes: z.number().int().nonnegative().optional(),
+    summary: z.string().max(50_000).optional(),
+    metadata: z.record(z.string(), z.unknown()).default({})
+  })).default([]),
   payload: z.record(z.string(), z.unknown()).default({})
+}).superRefine((value, ctx) => {
+  if (value.workspace?.scope === "job-attempt" && (!value.workspace.jobId || !value.workspace.attempt)) {
+    ctx.addIssue({ code: "custom", path: ["workspace"], message: "job-attempt workspace requires jobId and attempt" });
+  }
 });
-export type RecordFlowEventInput = z.infer<typeof RecordFlowEventInputSchema>;
+export type RecordFlowEventInput = z.input<typeof RecordFlowEventInputSchema>;
 
 export const CreateHumanGateInputSchema = z.object({
   externalGateId: z.string().min(1),
