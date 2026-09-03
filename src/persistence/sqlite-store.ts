@@ -287,6 +287,16 @@ export class SqliteStore {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS human_decision_delivery_attempts (
+        id TEXT PRIMARY KEY,
+        decision_id TEXT NOT NULL REFERENCES human_decisions(id),
+        attempt INTEGER NOT NULL,
+        delivery_status TEXT NOT NULL,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(decision_id, attempt)
+      );
+
       CREATE TABLE IF NOT EXISTS evidence_bundles (
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -335,6 +345,7 @@ export class SqliteStore {
       CREATE INDEX IF NOT EXISTS idx_gates_status ON human_gates(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_provider_workspace_run ON provider_workspace_handles(flow_run_id, created_at);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_human_decisions_gate ON human_decisions(gate_id);
+      CREATE INDEX IF NOT EXISTS idx_human_decision_delivery_attempts ON human_decision_delivery_attempts(decision_id, attempt);
       CREATE INDEX IF NOT EXISTS idx_evidence_items_bundle ON evidence_items(bundle_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_audit_aggregate ON audit_events(aggregate_type, aggregate_id, created_at);
     `);
@@ -354,6 +365,12 @@ export class SqliteStore {
       this.db.exec("ALTER TABLE human_decisions ADD COLUMN updated_at TEXT");
       this.db.exec("UPDATE human_decisions SET updated_at = created_at WHERE updated_at IS NULL");
     }
+    // Backfill the immutable decision's initial delivery projection as attempt 1.
+    // This keeps databases created before delivery attempts were split compatible.
+    this.db.exec(`INSERT OR IGNORE INTO human_decision_delivery_attempts (
+      id, decision_id, attempt, delivery_status, last_error, created_at
+    ) SELECT id || ':delivery:1', id, 1, delivery_status, last_error,
+      COALESCE(updated_at, created_at) FROM human_decisions`);
     const eventColumns = this.db.prepare("PRAGMA table_info(flow_events)").all() as Array<{ name: string }>;
     if (!eventColumns.some((column) => column.name === "event_hash")) {
       this.db.exec("ALTER TABLE flow_events ADD COLUMN event_hash TEXT");
@@ -1021,20 +1038,40 @@ export class SqliteStore {
       decision.createdAt,
       decision.updatedAt
     );
+    this.insertHumanDecisionDeliveryAttempt(decision, decision.deliveryAttempt ?? 1);
   }
 
   getHumanDecision(gateId: string): HumanDecision | undefined {
-    const row = this.db.prepare("SELECT * FROM human_decisions WHERE gate_id = ?").get(gateId) as Record<string, unknown> | undefined;
+    const row = this.db.prepare(`SELECT d.*,
+      a.attempt AS delivery_attempt,
+      a.delivery_status AS attempt_delivery_status,
+      a.last_error AS attempt_last_error,
+      a.created_at AS attempt_created_at
+      FROM human_decisions d
+      LEFT JOIN human_decision_delivery_attempts a
+        ON a.decision_id = d.id
+       AND a.attempt = (SELECT MAX(a2.attempt) FROM human_decision_delivery_attempts a2 WHERE a2.decision_id = d.id)
+      WHERE d.gate_id = ?`).get(gateId) as Record<string, unknown> | undefined;
     return row ? this.humanDecisionFromRow(row) : undefined;
   }
 
   updateHumanDecisionDelivery(decision: HumanDecision): void {
-    this.db.prepare(`UPDATE human_decisions
-      SET delivery_status = ?, last_error = ?, updated_at = ? WHERE id = ?`).run(
+    const latest = this.db.prepare(
+      "SELECT MAX(attempt) AS attempt FROM human_decision_delivery_attempts WHERE decision_id = ?"
+    ).get(decision.id) as { attempt?: number | null } | undefined;
+    this.insertHumanDecisionDeliveryAttempt(decision, Number(latest?.attempt ?? decision.deliveryAttempt ?? 0) + 1);
+  }
+
+  private insertHumanDecisionDeliveryAttempt(decision: HumanDecision, attempt: number): void {
+    this.db.prepare(`INSERT INTO human_decision_delivery_attempts (
+      id, decision_id, attempt, delivery_status, last_error, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?)`).run(
+      `${decision.id}:delivery:${attempt}`,
+      decision.id,
+      attempt,
       decision.deliveryStatus,
       decision.lastError ?? null,
-      decision.updatedAt,
-      decision.id
+      decision.updatedAt
     );
   }
 
@@ -1046,15 +1083,27 @@ export class SqliteStore {
       decision: row["decision"] as HumanDecision["decision"],
       ...(optionalString(row["comment"]) ? { comment: optionalString(row["comment"]) } : {}),
       input: fromJson(row["input_json"], {}),
-      deliveryStatus: String(row["delivery_status"]) as HumanDecision["deliveryStatus"],
-      ...(optionalString(row["last_error"]) ? { lastError: optionalString(row["last_error"]) } : {}),
+      deliveryStatus: (optionalString(row["attempt_delivery_status"]) ?? String(row["delivery_status"])) as HumanDecision["deliveryStatus"],
+      ...((optionalString(row["attempt_last_error"]) ?? optionalString(row["last_error"])) ? {
+        lastError: optionalString(row["attempt_last_error"]) ?? optionalString(row["last_error"])
+      } : {}),
       createdAt: String(row["created_at"]),
-      updatedAt: optionalString(row["updated_at"]) ?? String(row["created_at"])
+      updatedAt: optionalString(row["attempt_created_at"]) ?? optionalString(row["updated_at"]) ?? String(row["created_at"]),
+      ...(optionalNumber(row["delivery_attempt"]) !== undefined ? { deliveryAttempt: optionalNumber(row["delivery_attempt"]) } : {})
     };
   }
 
   listHumanDecisions(gateId: string): HumanDecision[] {
-    const rows = this.db.prepare("SELECT * FROM human_decisions WHERE gate_id = ? ORDER BY created_at ASC").all(gateId) as Record<string, unknown>[];
+    const rows = this.db.prepare(`SELECT d.*,
+      a.attempt AS delivery_attempt,
+      a.delivery_status AS attempt_delivery_status,
+      a.last_error AS attempt_last_error,
+      a.created_at AS attempt_created_at
+      FROM human_decisions d
+      LEFT JOIN human_decision_delivery_attempts a
+        ON a.decision_id = d.id
+       AND a.attempt = (SELECT MAX(a2.attempt) FROM human_decision_delivery_attempts a2 WHERE a2.decision_id = d.id)
+      WHERE d.gate_id = ? ORDER BY d.created_at ASC`).all(gateId) as Record<string, unknown>[];
     return rows.map((row) => this.humanDecisionFromRow(row));
   }
 

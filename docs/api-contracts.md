@@ -62,6 +62,15 @@ the values shown above. `writablePerRepository` cannot exceed
 `capacity.perRepository`; the current contract supports FIFO admission and
 requires a distinct Workspace for every writable task attempt.
 
+The current Core runtime accepts only `mode: "local-cli"`; `local-service` and
+`remote-host` are reserved for profiles with a wired execution host and are
+rejected rather than silently treated as local CLI. Branch constraints are
+whole-string globs: `*` matches any sequence (including `/`), `?` matches one
+character, and all other characters match literally. An empty pattern list is
+unrestricted. M0 currently supports `cleanup: "manual"` and
+`snapshotOnTerminal: true`; other workspace policy combinations are rejected
+until their provider behavior is implemented and recoverable.
+
 These fields publish the M0 admission contract. Enforcement and durable
 capacity leases are delivered by M2; the synchronous MVP records the policy but
 does not yet queue competing tasks.
@@ -242,6 +251,10 @@ Event types:
 ```
 
 The endpoint may return `502 INTEGRATION_ERROR` with `details.retryable: true` when the decision is persisted but delivery to `zigma-flow` fails. The gate remains `decision_failed`; resubmitting the identical request retries delivery. A different decision or actor returns `409 CONFLICT`.
+
+The `HumanDecision` record is append-only. Each delivery retry is recorded as a
+separate delivery attempt; the returned decision status is the latest attempt
+projection and does not mutate the original decision row.
 
 ## Evidence
 

@@ -242,6 +242,8 @@ export interface HumanDecision {
   input: Record<string, unknown>;
   deliveryStatus: "pending" | "failed" | "delivered";
   lastError?: string;
+  /** Latest append-only delivery attempt number. */
+  deliveryAttempt?: number;
   createdAt: string;
   updatedAt: string;
 }
