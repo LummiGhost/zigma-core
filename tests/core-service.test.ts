@@ -13,6 +13,7 @@ import type {
   WorkspaceProvider
 } from "../src/contracts/ports.js";
 import { CoreService } from "../src/application/core-service.js";
+import { ExecutionAdmissionService } from "../src/application/execution-admission.js";
 import type { DecideHumanGateInput } from "../src/contracts/schemas.js";
 import { SqliteStore } from "../src/persistence/sqlite-store.js";
 import { ConflictError, ForbiddenError } from "../src/domain/errors.js";
@@ -178,6 +179,57 @@ function startInput() {
 }
 
 describe("CoreService", () => {
+  it("atomically limits admission across 20 queued commands", async () => {
+    const { core, store, project, task } = setup();
+    const tasks = [task];
+    for (let index = 1; index < 20; index += 1) {
+      tasks.push(core.createTask({
+        projectId: project.id, title: `Task ${index}`, description: `Run ${index}`,
+        priority: "normal", source: { kind: "api", metadata: {} },
+        createdBy: { type: "user", id: "owner" }, labels: [], metadata: {}
+      }));
+    }
+    const commandIds: string[] = [];
+    for (const current of tasks) {
+      const view = await core.startTask(current.id, { ...startInput(), idempotencyKey: `start-${current.id}` });
+      const command = view.executionCommand!;
+      store.updateExecutionCommand({ ...command, status: "pending", attempt: 0, completedAt: undefined, updatedAt: command.updatedAt });
+      commandIds.push(command.id);
+    }
+    const admission = new ExecutionAdmissionService(store, new FakeClock(), new FakeIds());
+    const policy = {
+      contractVersion: 1 as const,
+      capacity: { global: 4, perProject: 4, perRepository: 4, perBackend: 4 },
+      admission: { writablePerRepository: 4, queueDiscipline: "fifo" as const, requireDistinctWorkspace: true as const }
+    };
+
+    const results = commandIds.map((id, index) => admission.admit(id, `worker-${index}`, policy, 60_000));
+
+    expect(results.filter((result) => result.outcome === "acquired")).toHaveLength(4);
+    expect(results.slice(4).every((result) => result.outcome === "queued" && result.limitedBy.includes("global"))).toBe(true);
+  });
+
+  it("fences stale owners and reconciles an expired lease before reacquisition", async () => {
+    const { core, store, task } = setup();
+    const view = await core.startTask(task.id, { ...startInput(), idempotencyKey: "lease-test" });
+    const command = view.executionCommand!;
+    store.updateExecutionCommand({ ...command, status: "pending", completedAt: undefined, updatedAt: command.updatedAt });
+    const admission = new ExecutionAdmissionService(store, new FakeClock(), new FakeIds());
+    const policy = {
+      contractVersion: 1 as const,
+      capacity: { global: 4, perProject: 4, perRepository: 2, perBackend: 4 },
+      admission: { writablePerRepository: 1, queueDiscipline: "fifo" as const, requireDistinctWorkspace: true as const }
+    };
+    const acquired = admission.admit(command.id, "worker-a", policy, 1);
+    expect(acquired.outcome).toBe("acquired");
+    if (acquired.outcome !== "acquired") throw new Error("expected lease");
+
+    expect(() => admission.release(command.id, "worker-b", acquired.lease.fencingToken)).toThrow(ConflictError);
+    const expired = admission.admit(command.id, "worker-b", policy, 60_000);
+    expect(expired).toMatchObject({ outcome: "reconcile", lease: { status: "reconciling", fencingToken: 1 } });
+    expect(store.getExecutionCommand(command.id).status).toBe("reconciling");
+  });
+
   it("persists one command and outbox record for an idempotent start", async () => {
     const { core, flow, store, task } = setup();
     const input = { ...startInput(), idempotencyKey: "start-model-v1" };

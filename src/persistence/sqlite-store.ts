@@ -9,6 +9,7 @@ import type {
   EvidenceBundle,
   EvidenceItem,
   ExecutionCommand,
+  ExecutionLease,
   ExecutionProfile,
   FlowRun,
   HumanDecision,
@@ -187,6 +188,22 @@ export class SqliteStore {
         last_error TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS execution_leases (
+        id TEXT PRIMARY KEY,
+        command_id TEXT NOT NULL UNIQUE REFERENCES execution_commands(id),
+        owner_id TEXT NOT NULL,
+        fencing_token INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        repository_url TEXT NOT NULL,
+        backend TEXT NOT NULL,
+        writable INTEGER NOT NULL,
+        acquired_at TEXT NOT NULL,
+        renewed_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        released_at TEXT
+      );
+
       CREATE TABLE IF NOT EXISTS workspaces (
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -291,6 +308,7 @@ export class SqliteStore {
       CREATE INDEX IF NOT EXISTS idx_flow_runs_task ON flow_runs(task_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_execution_commands_status ON execution_commands(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox_deliveries(status, available_at, created_at);
+      CREATE INDEX IF NOT EXISTS idx_execution_leases_capacity ON execution_leases(status, project_id, repository_url, backend);
       CREATE INDEX IF NOT EXISTS idx_gates_status ON human_gates(status, created_at);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_human_decisions_gate ON human_decisions(gate_id);
       CREATE INDEX IF NOT EXISTS idx_evidence_items_bundle ON evidence_items(bundle_id, created_at);
@@ -622,6 +640,108 @@ export class SqliteStore {
       ...(optionalString(row["delivered_at"]) ? { deliveredAt: optionalString(row["delivered_at"]) } : {}),
       ...(optionalString(row["last_error"]) ? { lastError: optionalString(row["last_error"]) } : {})
     }));
+  }
+
+  admitExecutionCommand(input: {
+    commandId: string;
+    leaseId: string;
+    ownerId: string;
+    now: string;
+    expiresAt: string;
+    policy: import("../contracts/schemas.js").ExecutionPolicy;
+  }): { outcome: "acquired"; lease: ExecutionLease } | { outcome: "queued"; limitedBy: string[] } | { outcome: "reconcile"; lease: ExecutionLease } {
+    return this.transaction(() => {
+      const command = this.getExecutionCommand(input.commandId);
+      if (["completed", "failed", "cancelled"].includes(command.status)) {
+        throw new ConflictError("Terminal execution command cannot acquire capacity", { commandId: command.id, status: command.status });
+      }
+      const existingRow = this.db.prepare("SELECT * FROM execution_leases WHERE command_id = ?").get(command.id) as Record<string, unknown> | undefined;
+      if (existingRow) {
+        const existing = this.mapExecutionLease(existingRow);
+        if (existing.status === "active" && Date.parse(existing.expiresAt) <= Date.parse(input.now)) {
+          const reconciling = { ...existing, status: "reconciling" as const, renewedAt: input.now };
+          this.updateExecutionLease(reconciling);
+          this.updateExecutionCommand({ ...command, status: "reconciling", updatedAt: input.now });
+          return { outcome: "reconcile", lease: reconciling };
+        }
+        if (existing.status === "active" && existing.ownerId === input.ownerId) {
+          const renewed = { ...existing, renewedAt: input.now, expiresAt: input.expiresAt };
+          this.updateExecutionLease(renewed);
+          return { outcome: "acquired", lease: renewed };
+        }
+        if (existing.status !== "released") return { outcome: "queued", limitedBy: ["command"] };
+      }
+
+      const active = this.db.prepare("SELECT project_id, repository_url, backend, writable FROM execution_leases WHERE status IN ('active', 'reconciling')").all() as Array<Record<string, unknown>>;
+      const limits = input.policy.capacity;
+      const limitedBy: string[] = [];
+      if (active.length >= limits.global) limitedBy.push("global");
+      if (active.filter((row) => row["project_id"] === command.projectId).length >= limits.perProject) limitedBy.push("project");
+      if (active.filter((row) => row["repository_url"] === command.repositoryUrl).length >= limits.perRepository) limitedBy.push("repository");
+      if (active.filter((row) => row["backend"] === command.backend).length >= limits.perBackend) limitedBy.push("backend");
+      const writable = command.workspacePolicy.mode === "writable";
+      if (writable && active.filter((row) => row["repository_url"] === command.repositoryUrl && Number(row["writable"]) === 1).length >= input.policy.admission.writablePerRepository) limitedBy.push("writable-repository");
+      if (limitedBy.length > 0) return { outcome: "queued", limitedBy };
+
+      const fencingToken = existingRow ? Number(existingRow["fencing_token"]) + 1 : 1;
+      const lease: ExecutionLease = {
+        id: input.leaseId, commandId: command.id, ownerId: input.ownerId, fencingToken,
+        status: "active", projectId: command.projectId, repositoryUrl: command.repositoryUrl,
+        backend: command.backend, writable, acquiredAt: input.now, renewedAt: input.now,
+        expiresAt: input.expiresAt
+      };
+      if (existingRow) {
+        this.db.prepare(`UPDATE execution_leases SET id=?, owner_id=?, fencing_token=?, status='active',
+          acquired_at=?, renewed_at=?, expires_at=?, released_at=NULL WHERE command_id=?`).run(
+          lease.id, lease.ownerId, lease.fencingToken, lease.acquiredAt, lease.renewedAt, lease.expiresAt, command.id
+        );
+      } else {
+        this.db.prepare(`INSERT INTO execution_leases (id, command_id, owner_id, fencing_token, status,
+          project_id, repository_url, backend, writable, acquired_at, renewed_at, expires_at, released_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`).run(
+          lease.id, lease.commandId, lease.ownerId, lease.fencingToken, lease.status, lease.projectId,
+          lease.repositoryUrl, lease.backend, lease.writable ? 1 : 0, lease.acquiredAt, lease.renewedAt, lease.expiresAt
+        );
+      }
+      this.updateExecutionCommand({ ...command, status: "leased", updatedAt: input.now });
+      return { outcome: "acquired", lease };
+    });
+  }
+
+  releaseExecutionLease(commandId: string, ownerId: string, fencingToken: number, now: string): ExecutionLease {
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM execution_leases WHERE command_id = ?").get(commandId) as Record<string, unknown> | undefined;
+      if (!row) throw new NotFoundError("execution lease", commandId);
+      const lease = this.mapExecutionLease(row);
+      if (lease.ownerId !== ownerId || lease.fencingToken !== fencingToken || lease.status !== "active") {
+        throw new ConflictError("Stale execution lease owner or fencing token", { commandId, ownerId, fencingToken, currentOwnerId: lease.ownerId, currentFencingToken: lease.fencingToken, status: lease.status });
+      }
+      const released = { ...lease, status: "released" as const, renewedAt: now, releasedAt: now };
+      this.updateExecutionLease(released);
+      return released;
+    });
+  }
+
+  getExecutionLease(commandId: string): ExecutionLease | undefined {
+    const row = this.db.prepare("SELECT * FROM execution_leases WHERE command_id = ?").get(commandId) as Record<string, unknown> | undefined;
+    return row ? this.mapExecutionLease(row) : undefined;
+  }
+
+  private updateExecutionLease(lease: ExecutionLease): void {
+    this.db.prepare("UPDATE execution_leases SET owner_id=?, fencing_token=?, status=?, renewed_at=?, expires_at=?, released_at=? WHERE command_id=?").run(
+      lease.ownerId, lease.fencingToken, lease.status, lease.renewedAt, lease.expiresAt, lease.releasedAt ?? null, lease.commandId
+    );
+  }
+
+  private mapExecutionLease(row: Record<string, unknown>): ExecutionLease {
+    return {
+      id: String(row["id"]), commandId: String(row["command_id"]), ownerId: String(row["owner_id"]),
+      fencingToken: Number(row["fencing_token"]), status: row["status"] as ExecutionLease["status"],
+      projectId: String(row["project_id"]), repositoryUrl: String(row["repository_url"]),
+      backend: String(row["backend"]), writable: Number(row["writable"]) === 1,
+      acquiredAt: String(row["acquired_at"]), renewedAt: String(row["renewed_at"]), expiresAt: String(row["expires_at"]),
+      ...(optionalString(row["released_at"]) ? { releasedAt: optionalString(row["released_at"]) } : {})
+    };
   }
 
   getFlowRun(id: string): FlowRun {

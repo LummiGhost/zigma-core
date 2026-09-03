@@ -30,8 +30,9 @@ export type GateStatus =
   | "cancelled";
 export type WorkspaceStatus = "preparing" | "ready" | "active" | "released" | "failed";
 export type EvidenceBundleStatus = "open" | "finalized" | "incomplete";
-export type ExecutionCommandStatus = "pending" | "dispatched" | "completed" | "failed" | "cancelled";
+export type ExecutionCommandStatus = "pending" | "leased" | "reconciling" | "dispatched" | "completed" | "failed" | "cancelled";
 export type OutboxDeliveryStatus = "pending" | "delivered" | "failed";
+export type ExecutionLeaseStatus = "active" | "reconciling" | "released";
 
 export interface ExecutionProfile {
   id: string;
@@ -177,6 +178,22 @@ export interface OutboxDelivery {
   updatedAt: string;
   deliveredAt?: string;
   lastError?: string;
+}
+
+export interface ExecutionLease {
+  id: string;
+  commandId: string;
+  ownerId: string;
+  fencingToken: number;
+  status: ExecutionLeaseStatus;
+  projectId: string;
+  repositoryUrl: string;
+  backend: string;
+  writable: boolean;
+  acquiredAt: string;
+  renewedAt: string;
+  expiresAt: string;
+  releasedAt?: string;
 }
 
 export interface HumanGate {
