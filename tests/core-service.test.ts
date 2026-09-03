@@ -35,6 +35,7 @@ class FakeIds implements IdGenerator {
 
 class FakeFlow implements FlowExecutor {
   readonly decisions: FlowGateDecisionRequest[] = [];
+  starts = 0;
   decisionError?: Error;
   result: FlowStartResult = {
     externalRunId: "zf-run-1",
@@ -45,6 +46,7 @@ class FakeFlow implements FlowExecutor {
   };
 
   async start(_request: FlowStartRequest): Promise<FlowStartResult> {
+    this.starts += 1;
     return this.result;
   }
 
@@ -176,6 +178,57 @@ function startInput() {
 }
 
 describe("CoreService", () => {
+  it("persists one command and outbox record for an idempotent start", async () => {
+    const { core, flow, store, task } = setup();
+    const input = { ...startInput(), idempotencyKey: "start-model-v1" };
+
+    const first = await core.startTask(task.id, input);
+    const repeated = await core.startTask(task.id, input);
+
+    expect(repeated.activeFlowRun?.id).toBe(first.activeFlowRun?.id);
+    expect(repeated.executionCommand).toMatchObject({
+      operationId: first.executionCommand?.id,
+      idempotencyKey: "start-model-v1",
+      status: "completed",
+      attempt: 1,
+      repositoryId: "main",
+      baseRef: "main",
+      callbackCorrelationId: first.executionCommand?.id
+    });
+    expect(flow.starts).toBe(1);
+    expect(store.listOutboxDeliveries()).toHaveLength(1);
+    expect(store.listOutboxDeliveries()[0]).toMatchObject({
+      topic: "execution-command.requested",
+      aggregateId: first.executionCommand?.id,
+      status: "pending"
+    });
+  });
+
+  it("rejects conflicting reuse of an idempotency key", async () => {
+    const { core, task } = setup();
+    await core.startTask(task.id, { ...startInput(), idempotencyKey: "same-key" });
+
+    await expect(core.startTask(task.id, {
+      ...startInput(), idempotencyKey: "same-key", inputs: { feature: "different" }
+    })).rejects.toMatchObject({ code: "CONFLICT" });
+  });
+
+  it("rolls back task, run, command, and outbox when durable intent cannot commit", async () => {
+    const { core, store, task } = setup();
+    const original = store.insertOutboxDelivery.bind(store);
+    store.insertOutboxDelivery = () => { throw new Error("simulated commit boundary failure"); };
+
+    await expect(core.startTask(task.id, {
+      ...startInput(), idempotencyKey: "rollback-key"
+    })).rejects.toThrow("simulated commit boundary failure");
+
+    store.insertOutboxDelivery = original;
+    expect(core.getTask(task.id)).toMatchObject({ status: "created", revision: 1 });
+    expect(store.listFlowRunsForTask(task.id)).toEqual([]);
+    expect(store.findExecutionCommandByIdempotencyKey(task.id, "rollback-key")).toBeUndefined();
+    expect(store.listOutboxDeliveries()).toEqual([]);
+  });
+
   it("runs a complete task and assembles workspace evidence", async () => {
     const { core, task } = setup();
 

@@ -30,6 +30,8 @@ export type GateStatus =
   | "cancelled";
 export type WorkspaceStatus = "preparing" | "ready" | "active" | "released" | "failed";
 export type EvidenceBundleStatus = "open" | "finalized" | "incomplete";
+export type ExecutionCommandStatus = "pending" | "dispatched" | "completed" | "failed" | "cancelled";
+export type OutboxDeliveryStatus = "pending" | "delivered" | "failed";
 
 export interface ExecutionProfile {
   id: string;
@@ -137,6 +139,44 @@ export interface FlowRun {
   createdAt: string;
   updatedAt: string;
   completedAt?: string;
+}
+
+export interface ExecutionCommand {
+  id: string;
+  operationId: string;
+  idempotencyKey?: string;
+  inputHash: string;
+  taskId: string;
+  flowRunId: string;
+  projectId: string;
+  repositoryId: string;
+  repositoryUrl: string;
+  baseRef: string;
+  backend: string;
+  workspacePolicy: WorkspacePolicy;
+  permissionSnapshotId: string;
+  callbackCorrelationId: string;
+  status: ExecutionCommandStatus;
+  attempt: number;
+  payload: Record<string, unknown>;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+
+export interface OutboxDelivery {
+  id: string;
+  topic: "execution-command.requested";
+  aggregateId: string;
+  payload: Record<string, unknown>;
+  status: OutboxDeliveryStatus;
+  attempt: number;
+  availableAt: string;
+  createdAt: string;
+  updatedAt: string;
+  deliveredAt?: string;
+  lastError?: string;
 }
 
 export interface HumanGate {
