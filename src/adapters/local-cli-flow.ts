@@ -126,7 +126,12 @@ export function buildContextFilePayload(request: FlowStartRequest): Record<strin
     coreCallbackUrl: request.coreCallbackUrl,
     actor: request.callerContext.actor,
     flowRunId: request.flowRunId,
-    taskId: request.taskId
+    taskId: request.taskId,
+    ...(request.operationId ? { operationId: request.operationId } : {}),
+    ...(request.callbackCorrelationId ? { callbackCorrelationId: request.callbackCorrelationId } : {}),
+    ...(request.repository ? { repository: request.repository } : {}),
+    ...(request.baseRef ? { baseRef: request.baseRef } : {}),
+    ...(request.workspacePolicy ? { workspacePolicy: request.workspacePolicy } : {})
   };
 }
 

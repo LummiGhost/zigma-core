@@ -4,6 +4,7 @@ export * from "./domain/errors.js";
 export * from "./application/core-service.js";
 export * from "./application/runtime.js";
 export * from "./application/execution-admission.js";
+export * from "./application/async-execution-runtime.js";
 export * from "./persistence/sqlite-store.js";
 export * from "./adapters/local-cli-flow.js";
 export * from "./adapters/zigma-workspace-cli.js";

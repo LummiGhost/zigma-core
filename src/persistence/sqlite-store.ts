@@ -581,6 +581,16 @@ export class SqliteStore {
     return this.mapExecutionCommand(row);
   }
 
+  listDispatchableExecutionCommands(): ExecutionCommand[] {
+    const rows = this.db.prepare("SELECT * FROM execution_commands WHERE status = 'pending' ORDER BY created_at ASC, id ASC").all() as Record<string, unknown>[];
+    return rows.map((row) => this.mapExecutionCommand(row));
+  }
+
+  listInFlightExecutionCommands(): ExecutionCommand[] {
+    const rows = this.db.prepare("SELECT * FROM execution_commands WHERE status IN ('leased', 'dispatched', 'reconciling') ORDER BY created_at ASC, id ASC").all() as Record<string, unknown>[];
+    return rows.map((row) => this.mapExecutionCommand(row));
+  }
+
   getExecutionCommandForRun(flowRunId: string): ExecutionCommand | undefined {
     const row = this.db.prepare("SELECT * FROM execution_commands WHERE flow_run_id = ?").get(flowRunId) as Record<string, unknown> | undefined;
     return row ? this.mapExecutionCommand(row) : undefined;
