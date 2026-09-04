@@ -36,6 +36,24 @@ npm install
 npm run check
 ```
 
+### Real provider-contract gate
+
+The ordinary unit suite skips the real-provider file when sibling source
+checkouts are unavailable. The dedicated gate rebuilds those checkouts first,
+then injects their absolute CLI paths into Vitest; it never accepts a stale
+provider `dist/` from `PATH`.
+
+```bash
+$env:ZIGMA_FLOW_REPO = 'D:\zigma\zigma-flow'
+$env:ZIGMA_WORKSPACE_REPO = 'D:\zigma\zigma-workspace'
+npm run test:m0-cross-repo
+```
+
+It proves the Flow `CallerContextV1` is accepted and frozen, and that Core
+rejects unknown provider versions and workspace artifact bytes whose `sha256`
+does not match the emitted `file:` URI. CI checks out the public handshake
+commits before running this same command.
+
 ## Run the API
 
 ```bash

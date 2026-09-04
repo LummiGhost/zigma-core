@@ -37,9 +37,18 @@ provider process exit code 单独推断 terminal/cleaned 状态。
 
 `LocalCliFlowExecutor` 使用：
 
+- 在每个 mutating command 前调用并缓存只读
+  `contract-info --json` handshake；只接受 provider `zigma-flow`、包版本
+  `0.8.12`、contract version `1` 以及 `caller-context-v1`、`invoke-json-v1`
+  和 `context-freeze-v1`；
 - `invoke --json --context-file`，校验 `contractVersion: 1`、run ID 和 status；
 - `resume ... --json` 提交 human gate decision；
 - `abort --run ... --reason ... --json` 记录取消请求。
+
+context file 是 Flow 的 canonical `CallerContextV1`：它保留 actor、capabilities、
+constraints、source、task/flow-run/project identity，以及 Core permission snapshot
+ID 和 integrity hash。Core 不会把缺失的 permission evidence 降级为 `null`；Flow
+接受后将该 record 冻结到每个 run 的 `caller-context.json`。
 
 Abort 响应不是进程终止证明。M2 execution lease 只在 dispatch 调用返回后释放；
 超时或结果不确定的 invocation 进入 `reconciling`，不盲目重跑或提前 cleanup。
@@ -53,10 +62,18 @@ reconcile 和 cleanup 权威。
 
 `ZigmaWorkspaceCliAdapter` 使用：
 
+- 在任何 create/bind/diff/snapshot/cleanup side effect 前调用并缓存只读
+  `contract-info --json` handshake；只接受 provider `zigma-workspace`、包版本
+  `0.1.5`、contract version `1` 和完整 M0 capability 集；
 - `create`、`bind-run`、`diff`、`snapshot` 和基础 `cleanup`；
-- 对所有响应校验 `contract_version: 1`；
+- 对所有 stdout success/error envelope 校验 `contract_version: 1`；
 - create/bind 使用由 Core flow run 派生的稳定 operation id；
 - cleanup 只有在 `removed: true` 时返回成功。
+
+证据收集把 `diff.patch_artifact` 和 `snapshot.artifacts` 视为不受信任的 provider
+metadata：每个 artifact 必须有 `file:` URI、lowercase `sha256:<64 hex>` digest 和
+可读本地 bytes，Core 重算 digest 后才登记 evidence。未知 handshake version 或
+篡改的 artifact bytes 都在后续 side effect/evidence 写入前 fail closed。
 
 Heartbeat、reconcile、integration lock 和 strict cleanup 在 M3 暴露 stable CLI
 前不能作为 Core 跨进程依赖。

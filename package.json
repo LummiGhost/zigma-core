@@ -25,6 +25,7 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:m0-cross-repo": "node tests/run-m0-cross-repo-contracts.mjs",
     "test:watch": "vitest",
     "check": "npm run typecheck && npm test && npm run build",
     "start": "node dist/cli.js"

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockExeca = vi.fn();
 
@@ -8,6 +8,27 @@ vi.mock("execa", () => ({
 
 // Dynamic import so the mock is in place before the module loads
 const { LocalCliFlowExecutor, buildContextFilePayload } = await import("../../src/adapters/local-cli-flow.js");
+
+function contractInfo(overrides: Record<string, unknown> = {}) {
+  return {
+    stdout: JSON.stringify({
+      contractVersion: 1,
+      provider: "zigma-flow",
+      packageVersion: "0.8.12",
+      capabilities: ["caller-context-v1", "invoke-json-v1", "context-freeze-v1"],
+      ...overrides
+    }),
+    exitCode: 0
+  };
+}
+
+let executor: InstanceType<typeof LocalCliFlowExecutor>;
+
+beforeEach(() => {
+  mockExeca.mockReset();
+  executor = new LocalCliFlowExecutor();
+  mockExeca.mockResolvedValueOnce(contractInfo());
+});
 
 function jsonEnvelope(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({
@@ -36,6 +57,7 @@ function commandEnvelope(command: "resume" | "abort", overrides: Record<string, 
 function defaultRequest(overrides: Record<string, unknown> = {}) {
   return {
     command: "zigma-flow",
+    projectId: "project-1",
     taskId: "task-1",
     flowRunId: "fr-1",
     workflowRef: "wf/main",
@@ -48,6 +70,8 @@ function defaultRequest(overrides: Record<string, unknown> = {}) {
       constraints: { repositoryIds: [], workflowRefs: [], toolNames: [], branchPatterns: [] },
       source: { kind: "api" as const, metadata: {} }
     },
+    permissionSnapshotId: "snap-1",
+    integrityHash: "sha256:abc123def",
     timeoutMs: 60_000,
     environment: {},
     dryRun: false,
@@ -56,8 +80,6 @@ function defaultRequest(overrides: Record<string, unknown> = {}) {
 }
 
 describe("LocalCliFlowExecutor.start", () => {
-  const executor = new LocalCliFlowExecutor();
-
   it("parses a valid JSON envelope into a FlowStartResult", async () => {
     mockExeca.mockResolvedValueOnce({
       stdout: jsonEnvelope(),
@@ -94,6 +116,49 @@ describe("LocalCliFlowExecutor.start", () => {
     const args = lastCall![1] as string[];
     expect(args).toContain("--json");
     expect(args).toContain("--context-file");
+  });
+
+  it("performs and caches a provider handshake before invoke", async () => {
+    mockExeca.mockResolvedValueOnce({ stdout: jsonEnvelope(), exitCode: 0 });
+    mockExeca.mockResolvedValueOnce({ stdout: jsonEnvelope({ runId: "run-second" }), exitCode: 0 });
+
+    await executor.start(defaultRequest());
+    await executor.start(defaultRequest({ flowRunId: "fr-2" }));
+
+    expect(mockExeca).toHaveBeenCalledTimes(3);
+    expect(mockExeca.mock.calls[0]?.[1]).toEqual(["contract-info", "--json"]);
+    expect(mockExeca.mock.calls[1]?.[1]).toContain("invoke");
+    expect(mockExeca.mock.calls[2]?.[1]).toContain("invoke");
+  });
+
+  it("fails closed on an unknown provider contract before invoke", async () => {
+    mockExeca.mockReset();
+    mockExeca.mockResolvedValueOnce(contractInfo({ contractVersion: 99 }));
+
+    await expect(executor.start(defaultRequest())).rejects.toThrow(
+      "zigma-flow contract version mismatch: expected 1, got 99"
+    );
+    expect(mockExeca).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a non-object handshake before invoke", async () => {
+    mockExeca.mockReset();
+    mockExeca.mockResolvedValueOnce({ stdout: "null", exitCode: 0 });
+
+    await expect(executor.start(defaultRequest())).rejects.toThrow(
+      "zigma-flow contract-info must return an object"
+    );
+    expect(mockExeca).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed when a required provider capability is absent", async () => {
+    mockExeca.mockReset();
+    mockExeca.mockResolvedValueOnce(contractInfo({ capabilities: ["invoke-json-v1"] }));
+
+    await expect(executor.start(defaultRequest())).rejects.toThrow(
+      "zigma-flow is missing required provider capabilities"
+    );
+    expect(mockExeca).toHaveBeenCalledTimes(1);
   });
 
   it("throws IntegrationError when stdout is not valid JSON", async () => {
@@ -234,36 +299,40 @@ describe("buildContextFilePayload", () => {
     const payload = buildContextFilePayload(request);
 
     expect(payload).toEqual({
-      permissionSnapshotId: "snap-1",
-      integrityHash: "abc123def",
+      contractVersion: 1,
+      actor: { type: "user", id: "alice" },
       capabilities: ["task:create"],
       constraints: {
-        allowedRepos: [],
-        allowedBranches: [],
-        maxRunDurationMs: null
+        repositoryIds: [],
+        workflowRefs: [],
+        toolNames: [],
+        branchPatterns: []
       },
       source: { kind: "api", metadata: {} },
-      coreCallbackUrl: "http://127.0.0.1:4736/v1",
-      actor: { type: "user", id: "alice" },
+      taskId: "task-1",
       flowRunId: "fr-1",
-      taskId: "task-1"
+      projectId: "project-1",
+      permissionSnapshotId: "snap-1",
+      integrityHash: "abc123def",
+      coreCallbackUrl: "http://127.0.0.1:4736/v1",
     });
   });
 
-  it("defaults null for optional fields", () => {
-    const request = defaultRequest();
+  it("omits optional correlation and callback fields", () => {
+    const payload = buildContextFilePayload(defaultRequest());
 
-    const payload = buildContextFilePayload(request);
-
-    expect(payload.permissionSnapshotId).toBeNull();
-    expect(payload.integrityHash).toBeNull();
+    expect(payload.operationId).toBeUndefined();
+    expect(payload.callbackCorrelationId).toBeUndefined();
     expect(payload.coreCallbackUrl).toBeUndefined();
+  });
+
+  it("rejects missing permission evidence instead of emitting null", () => {
+    expect(() => buildContextFilePayload(defaultRequest({ permissionSnapshotId: "" })))
+      .toThrow("requires permission snapshot evidence");
   });
 });
 
 describe("LocalCliFlowExecutor command contracts", () => {
-  const executor = new LocalCliFlowExecutor();
-
   it("uses the versioned resume JSON command for gate decisions", async () => {
     mockExeca.mockResolvedValueOnce({
       stdout: commandEnvelope("resume"),
