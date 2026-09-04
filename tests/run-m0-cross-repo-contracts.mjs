@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { chmodSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -32,12 +32,23 @@ function run(command, args, cwd, env = process.env) {
 run("pnpm", ["run", "build"], flowRoot);
 run("npm", ["run", "build"], workspaceRoot);
 
+const flowCliPath = resolve(flowRoot, "dist", "cli.js");
+const workspaceCliPath = resolve(workspaceRoot, "dist", "cli", "index.js");
+
+// Source builds do not promise executable mode for emitted JavaScript. The
+// installed npm bins do, and Core invokes the CLI path directly, so mirror that
+// installation boundary before injecting absolute paths into the real gate.
+chmodSync(flowCliPath, 0o755);
+chmodSync(workspaceCliPath, 0o755);
+run(flowCliPath, ["contract-info", "--json"], flowRoot);
+run(workspaceCliPath, ["contract-info", "--json"], workspaceRoot);
+
 run(process.execPath, [
   resolve(coreRoot, "node_modules", "vitest", "vitest.mjs"),
   "run",
   "tests/adapters/m0-real-cli.contract.test.ts"
 ], coreRoot, {
   ...process.env,
-  ZIGMA_FLOW_CLI_PATH: resolve(flowRoot, "dist", "cli.js"),
-  ZIGMA_WORKSPACE_CLI_PATH: resolve(workspaceRoot, "dist", "cli", "index.js")
+  ZIGMA_FLOW_CLI_PATH: flowCliPath,
+  ZIGMA_WORKSPACE_CLI_PATH: workspaceCliPath
 });
