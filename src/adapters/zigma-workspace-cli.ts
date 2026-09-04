@@ -71,7 +71,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 const WORKSPACE_CONTRACT_VERSION = 1;
 const WORKSPACE_PROVIDER = "zigma-workspace";
-const WORKSPACE_PACKAGE_VERSION = "0.1.5";
 const REQUIRED_WORKSPACE_CAPABILITIES = [
   "workspace-create-v1",
   "workspace-bind-run-v1",
@@ -153,11 +152,13 @@ function validateContractInfo(info: WorkspaceContractInfo): WorkspaceContractInf
       { provider: info.provider, expectedProvider: WORKSPACE_PROVIDER }
     );
   }
-  if (info.package_version !== WORKSPACE_PACKAGE_VERSION) {
-    throw new IntegrationError(
-      `zigma-workspace package version mismatch: expected ${WORKSPACE_PACKAGE_VERSION}, got ${String(info.package_version)}`,
-      { packageVersion: info.package_version, expectedVersion: WORKSPACE_PACKAGE_VERSION }
-    );
+  // Keep the advertised package version in the cached handshake for operator
+  // diagnostics, but negotiate compatibility solely through identity, v1, and
+  // required capabilities so compatible provider releases keep working.
+  if (typeof info.package_version !== "string" || !info.package_version.trim()) {
+    throw new IntegrationError("zigma-workspace contract-info package_version must be a non-empty string", {
+      packageVersion: info.package_version
+    });
   }
   if (!Array.isArray(info.capabilities) || !info.capabilities.every((item) => typeof item === "string")) {
     throw new IntegrationError("zigma-workspace contract-info capabilities must be a string array");

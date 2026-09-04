@@ -38,9 +38,9 @@ provider process exit code 单独推断 terminal/cleaned 状态。
 `LocalCliFlowExecutor` 使用：
 
 - 在每个 mutating command 前调用并缓存只读
-  `contract-info --json` handshake；只接受 provider `zigma-flow`、包版本
-  `0.8.12`、contract version `1` 以及 `caller-context-v1`、`invoke-json-v1`
-  和 `context-freeze-v1`；
+  `contract-info --json` handshake；只接受 provider `zigma-flow`、contract
+  version `1` 以及 `caller-context-v1`、`invoke-json-v1` 和
+  `context-freeze-v1`。`packageVersion` 必须是非空诊断字段，但不参与兼容性拒绝；
 - `invoke --json --context-file`，校验 `contractVersion: 1`、run ID 和 status；
 - `resume ... --json` 提交 human gate decision；
 - `abort --run ... --reason ... --json` 记录取消请求。
@@ -63,8 +63,9 @@ reconcile 和 cleanup 权威。
 `ZigmaWorkspaceCliAdapter` 使用：
 
 - 在任何 create/bind/diff/snapshot/cleanup side effect 前调用并缓存只读
-  `contract-info --json` handshake；只接受 provider `zigma-workspace`、包版本
-  `0.1.5`、contract version `1` 和完整 M0 capability 集；
+  `contract-info --json` handshake；只接受 provider `zigma-workspace`、contract
+  version `1` 和完整 M0 capability 集。`package_version` 必须是非空诊断字段，但
+  不参与兼容性拒绝；
 - `create`、`bind-run`、`diff`、`snapshot` 和基础 `cleanup`；
 - 对所有 stdout success/error envelope 校验 `contract_version: 1`；
 - create/bind 使用由 Core flow run 派生的稳定 operation id；

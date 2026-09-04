@@ -635,12 +635,12 @@ export class CoreService {
       timeoutMs: profile.timeoutMs,
       environment: profile.environment
     };
-    await this.flowExecutor.preflight?.({ ...context, command: profile.flowCommand });
+    await this.flowExecutor.preflight({ ...context, command: profile.flowCommand });
     if (!requiresWorkspace) return;
     if (!this.workspaceProvider) {
       throw new IntegrationError("Project requires a workspace provider, but none is configured");
     }
-    await this.workspaceProvider.preflight?.({ ...context, command: profile.workspaceCommand });
+    await this.workspaceProvider.preflight({ ...context, command: profile.workspaceCommand });
   }
 
   recordFlowEvent(flowRunId: string, raw: RecordFlowEventInput): TaskView {

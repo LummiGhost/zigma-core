@@ -161,6 +161,23 @@ describe("LocalCliFlowExecutor.start", () => {
     expect(mockExeca).toHaveBeenCalledTimes(1);
   });
 
+  it("accepts a compatible provider release with a different diagnostic packageVersion", async () => {
+    mockExeca.mockReset();
+    mockExeca.mockResolvedValueOnce(contractInfo({ packageVersion: "0.8.13" }));
+    mockExeca.mockResolvedValueOnce({ stdout: jsonEnvelope(), exitCode: 0 });
+
+    await expect(executor.start(defaultRequest())).resolves.toMatchObject({ status: "completed" });
+  });
+
+  it("rejects a missing diagnostic packageVersion", async () => {
+    mockExeca.mockReset();
+    mockExeca.mockResolvedValueOnce(contractInfo({ packageVersion: "" }));
+
+    await expect(executor.start(defaultRequest())).rejects.toThrow(
+      "zigma-flow contract-info packageVersion must be a non-empty string"
+    );
+  });
+
   it("throws IntegrationError when stdout is not valid JSON", async () => {
     mockExeca.mockResolvedValueOnce({
       stdout: "not json at all",

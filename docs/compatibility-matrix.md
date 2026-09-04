@@ -29,8 +29,9 @@ Core adapter 可使用的能力，不提前声称 durable execution、可靠事�
   level，并记录首个包含它的发布版本。
 - Core 当前尚无 Git release tag。`0.1.0` 是 source/package baseline；对外发布
   前，release job 必须把最终 M0 merge commit 与包版本绑定。
-- 包版本满足下限仍不充分。进程响应的契约版本和请求所需 capability 必须同时
-  匹配，否则在任何外部副作用前失败。
+- 表中的 package version 是已验证的发布基线和诊断信息，不是 Core admission 的
+  精确或范围比较。进程响应的 provider identity、契约版本和请求所需 capability
+  必须同时匹配，否则在任何外部副作用前失败。
 
 ### 1.1 Runtime 下限
 
@@ -281,8 +282,9 @@ rollback、幂等冲突、20-command/capacity-4、stale fencing、异步返回�
 
 不支持的组合包括：
 
-- Flow `<0.8.12` 或 invoke contract 非 1；
-- Workspace `<0.1.5`、缺少 `contract_version: 1` 或返回非 envelope pending 数据；
+- Flow 不声明 `zigma-flow` provider、contract version `1` 或 M0 capabilities；
+- Workspace 不声明 `zigma-workspace` provider、`contract_version: 1`、完整 M0
+  capabilities，或返回非 envelope pending 数据；
 - 要求 reliable events 却只配置 best-effort `--event-file`；
 - 要求强隔离却只依赖 manifest/read-only Git 标记；
 - 未实现 M2 durable command 却把自动重试当作 exactly-once；

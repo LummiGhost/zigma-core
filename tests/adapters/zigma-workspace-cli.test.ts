@@ -155,6 +155,23 @@ describe("ZigmaWorkspaceCliAdapter", () => {
     expect(mockExeca).toHaveBeenCalledTimes(1);
   });
 
+  it("accepts a compatible provider release with a different diagnostic package_version", async () => {
+    mockExeca.mockReset();
+    mockExeca.mockResolvedValueOnce(contractInfo({ package_version: "0.1.6" }));
+    mockExeca.mockResolvedValueOnce({ stdout: okEnvelope(workspaceData()), exitCode: 0 });
+
+    await expect(adapter.prepare(preparationRequest())).resolves.toMatchObject({ externalId: "ws-1" });
+  });
+
+  it("rejects a missing diagnostic package_version", async () => {
+    mockExeca.mockReset();
+    mockExeca.mockResolvedValueOnce(contractInfo({ package_version: "" }));
+
+    await expect(adapter.prepare(preparationRequest())).rejects.toThrow(
+      "zigma-workspace contract-info package_version must be a non-empty string"
+    );
+  });
+
   it("rejects an unsupported contract version", async () => {
     mockExeca.mockResolvedValueOnce({
       stdout: JSON.stringify({ contract_version: 2, ok: true, data: workspaceData() }),

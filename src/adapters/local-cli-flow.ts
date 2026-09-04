@@ -8,7 +8,6 @@ import { IntegrationError } from "../domain/errors.js";
 
 const FLOW_CONTRACT_VERSION = 1;
 const FLOW_PROVIDER = "zigma-flow";
-const FLOW_PACKAGE_VERSION = "0.8.12";
 const REQUIRED_FLOW_CAPABILITIES = [
   "caller-context-v1",
   "invoke-json-v1",
@@ -90,11 +89,14 @@ function parseContractInfo(stdout: string, processExitCode: number): FlowContrac
       { provider: info.provider, expectedProvider: FLOW_PROVIDER }
     );
   }
-  if (info.packageVersion !== FLOW_PACKAGE_VERSION) {
-    throw new IntegrationError(
-      `zigma-flow package version mismatch: expected ${FLOW_PACKAGE_VERSION}, got ${String(info.packageVersion)}`,
-      { packageVersion: info.packageVersion, expectedVersion: FLOW_PACKAGE_VERSION }
-    );
+  // Retain the provider's package version in the cached handshake for
+  // diagnostics, but do not treat a patch/minor package release as a protocol
+  // incompatibility. Provider identity, contract version, and capabilities
+  // are the compatibility boundary.
+  if (typeof info.packageVersion !== "string" || !info.packageVersion.trim()) {
+    throw new IntegrationError("zigma-flow contract-info packageVersion must be a non-empty string", {
+      packageVersion: info.packageVersion
+    });
   }
   if (!Array.isArray(info.capabilities) || !info.capabilities.every((item) => typeof item === "string")) {
     throw new IntegrationError("zigma-flow contract-info capabilities must be a string array");

@@ -6,6 +6,8 @@ import { buildServer } from "../src/api/server.js";
 import { SqliteStore } from "../src/persistence/sqlite-store.js";
 
 class CompletedFlow implements FlowExecutor {
+  async preflight(): Promise<void> {}
+
   async start(_request: FlowStartRequest): Promise<FlowStartResult> {
     return { externalRunId: "run-api", status: "completed", exitCode: 0, metadata: {} };
   }

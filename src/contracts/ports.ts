@@ -42,7 +42,7 @@ export interface WorkspaceInvocationContext {
 }
 
 export interface WorkspaceProvider {
-  preflight?(context: WorkspaceInvocationContext): Promise<void>;
+  preflight(context: WorkspaceInvocationContext): Promise<void>;
   prepare(request: WorkspacePreparationRequest): Promise<PreparedWorkspace>;
   bindRun?(externalWorkspaceId: string, taskId: string, flowRunId: string, context: WorkspaceInvocationContext): Promise<void>;
   collectEvidence?(externalWorkspaceId: string, context: WorkspaceInvocationContext): Promise<WorkspaceEvidence>;
@@ -109,7 +109,7 @@ export interface FlowCancelRequest {
 }
 
 export interface FlowExecutor {
-  preflight?(context: WorkspaceInvocationContext): Promise<void>;
+  preflight(context: WorkspaceInvocationContext): Promise<void>;
   start(request: FlowStartRequest): Promise<FlowStartResult>;
   decideGate?(request: FlowGateDecisionRequest): Promise<void>;
   cancel?(request: FlowCancelRequest): Promise<void>;
