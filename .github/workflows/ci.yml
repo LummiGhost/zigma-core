@@ -18,3 +18,34 @@ jobs:
           node-version: 22
       - run: npm ci
       - run: npm run check
+
+  m0-cross-repo-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+      - run: npm ci
+      # These repositories are public. Pin the provider handshake commits so this
+      # gate is a reproducible consumer proof rather than an accidental test of
+      # whatever happens to be installed on PATH.
+      - uses: actions/checkout@v4
+        with:
+          repository: LummiGhost/zigma-flow
+          ref: b46701c54a0e2685acdf484a5e0693e5df2e6e40
+          path: .providers/zigma-flow
+      - run: pnpm install --frozen-lockfile
+        working-directory: .providers/zigma-flow
+      - uses: actions/checkout@v4
+        with:
+          repository: LummiGhost/zigma-workspace
+          ref: a5e2d8cfcc732189d9c5d46d39439f38d7072c81
+          path: .providers/zigma-workspace
+      - run: npm ci
+        working-directory: .providers/zigma-workspace
+      - run: npm run test:m0-cross-repo
+        env:
+          ZIGMA_FLOW_REPO: ${{ github.workspace }}/.providers/zigma-flow
+          ZIGMA_WORKSPACE_REPO: ${{ github.workspace }}/.providers/zigma-workspace

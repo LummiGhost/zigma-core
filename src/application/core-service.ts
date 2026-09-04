@@ -354,6 +354,8 @@ export class CoreService {
       status: "pending", attempt: 0, availableAt: now, createdAt: now, updatedAt: now
     };
 
+    await this.preflightProviders(profile, project.workspacePolicy.provider !== "none");
+
     this.store.transaction(() => {
       task = this.transitionTask(task, "queued", input.callerContext.actor);
       task = { ...task, activeFlowRunId: flowRun.id, revision: task.revision + 1, updatedAt: now };
@@ -448,6 +450,7 @@ export class CoreService {
         operationId: executionCommand.operationId,
         callbackCorrelationId: executionCommand.callbackCorrelationId,
         command: profile.flowCommand,
+        projectId: project.id,
         taskId: task.id,
         flowRunId: flowRun.id,
         workflowRef,
@@ -531,6 +534,7 @@ export class CoreService {
     let workspace: WorkspaceRef | undefined;
     try {
       this.assertSupportedWorkspacePolicy(command.workspacePolicy);
+      await this.preflightProviders(profile, command.workspacePolicy.provider !== "none");
       const repository = project.repositories.find((candidate) => candidate.id === command.repositoryId);
       if (!repository) throw new ConflictError("Repository is not bound to the project", { repositoryId: command.repositoryId });
       this.assertBranchAllowed(payload.callerContext.constraints.branchPatterns, payload.branch);
@@ -574,7 +578,7 @@ export class CoreService {
       this.store.updateExecutionCommand({ ...command, status: "dispatched", updatedAt: startedAt });
       const result = await this.flowExecutor.start({
         operationId: command.operationId, callbackCorrelationId: command.callbackCorrelationId,
-        command: profile.flowCommand, taskId: task.id, flowRunId: run.id,
+        command: profile.flowCommand, projectId: project.id, taskId: task.id, flowRunId: run.id,
         workflowRef: payload.workflowRef, taskText: task.description,
         projectRoot: workspace?.path ?? String(project.metadata["projectRoot"] ?? process.cwd()),
         repository: project.repositories.find((candidate) => candidate.id === command.repositoryId),
@@ -621,6 +625,22 @@ export class CoreService {
       this.store.updateExecutionCommand({ ...latestCommand, status: "failed", lastError: message, updatedAt: failedAt, completedAt: failedAt });
       throw error;
     }
+  }
+
+  private async preflightProviders(
+    profile: ExecutionProfile,
+    requiresWorkspace: boolean
+  ): Promise<void> {
+    const context = {
+      timeoutMs: profile.timeoutMs,
+      environment: profile.environment
+    };
+    await this.flowExecutor.preflight({ ...context, command: profile.flowCommand });
+    if (!requiresWorkspace) return;
+    if (!this.workspaceProvider) {
+      throw new IntegrationError("Project requires a workspace provider, but none is configured");
+    }
+    await this.workspaceProvider.preflight({ ...context, command: profile.workspaceCommand });
   }
 
   recordFlowEvent(flowRunId: string, raw: RecordFlowEventInput): TaskView {

@@ -39,6 +39,8 @@ class FakeFlow implements FlowExecutor {
   readonly decisions: FlowGateDecisionRequest[] = [];
   starts = 0;
   startBarrier?: Promise<void>;
+
+  async preflight(): Promise<void> {}
   decisionError?: Error;
   result: FlowStartResult = {
     externalRunId: "zf-run-1",
@@ -61,6 +63,8 @@ class FakeFlow implements FlowExecutor {
 }
 
 class FakeWorkspace implements WorkspaceProvider {
+  async preflight(): Promise<void> {}
+
   async prepare(request: WorkspacePreparationRequest): Promise<PreparedWorkspace> {
     return {
       provider: "fake-workspace",
@@ -196,6 +200,18 @@ function startInput() {
 }
 
 describe("CoreService", () => {
+  it("fails provider preflight before persisting or starting an admission", async () => {
+    const { core, flow, store, task } = setup();
+    flow.preflight = async () => { throw new Error("provider handshake rejected"); };
+
+    await expect(core.startTask(task.id, startInput())).rejects.toThrow("provider handshake rejected");
+
+    expect(flow.starts).toBe(0);
+    expect(core.getTask(task.id)).toMatchObject({ status: "created", revision: 1 });
+    expect(store.listFlowRunsForTask(task.id)).toEqual([]);
+    expect(store.listOutboxDeliveries()).toEqual([]);
+  });
+
   it("returns accepted durable intent before background Flow execution and recovers it after restart", async () => {
     const { core, flow, store, project, task, clock, ids } = setup({ executionMode: "asynchronous" });
     let releaseFlow!: () => void;

@@ -42,6 +42,7 @@ export interface WorkspaceInvocationContext {
 }
 
 export interface WorkspaceProvider {
+  preflight(context: WorkspaceInvocationContext): Promise<void>;
   prepare(request: WorkspacePreparationRequest): Promise<PreparedWorkspace>;
   bindRun?(externalWorkspaceId: string, taskId: string, flowRunId: string, context: WorkspaceInvocationContext): Promise<void>;
   collectEvidence?(externalWorkspaceId: string, context: WorkspaceInvocationContext): Promise<WorkspaceEvidence>;
@@ -53,6 +54,7 @@ export interface FlowStartRequest {
   operationId?: string;
   callbackCorrelationId?: string;
   command: string;
+  projectId: string;
   taskId: string;
   flowRunId: string;
   workflowRef: string;
@@ -64,9 +66,9 @@ export interface FlowStartRequest {
   inputs: Record<string, string>;
   callerContext: CallerContext;
   /** ID of the PermissionSnapshot stored in Core. Sent via --context-file so zigma-flow can cross-reference. */
-  permissionSnapshotId?: string;
+  permissionSnapshotId: string;
   /** Stable hash of the caller context. Sent via --context-file for integrity verification. */
-  integrityHash?: string;
+  integrityHash: string;
   /** Base URL of the Core API (e.g. http://127.0.0.1:4736/v1). Sent via --context-file so zigma-flow can call back. */
   coreCallbackUrl?: string;
   backend?: string;
@@ -107,6 +109,7 @@ export interface FlowCancelRequest {
 }
 
 export interface FlowExecutor {
+  preflight(context: WorkspaceInvocationContext): Promise<void>;
   start(request: FlowStartRequest): Promise<FlowStartResult>;
   decideGate?(request: FlowGateDecisionRequest): Promise<void>;
   cancel?(request: FlowCancelRequest): Promise<void>;

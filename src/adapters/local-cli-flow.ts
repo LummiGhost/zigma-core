@@ -6,6 +6,14 @@ import type { FlowCancelRequest, FlowExecutor, FlowGateDecisionRequest, FlowStar
 import type { FlowRunStatus } from "../contracts/schemas.js";
 import { IntegrationError } from "../domain/errors.js";
 
+const FLOW_CONTRACT_VERSION = 1;
+const FLOW_PROVIDER = "zigma-flow";
+const REQUIRED_FLOW_CAPABILITIES = [
+  "caller-context-v1",
+  "invoke-json-v1",
+  "context-freeze-v1"
+] as const;
+
 const VALID_STATUSES = new Set<string>([
   "created",
   "starting",
@@ -33,6 +41,79 @@ interface FlowCommandEnvelope {
   runId: string;
   data?: Record<string, unknown>;
   error?: { code: string; message: string; details?: Record<string, unknown> };
+}
+
+interface FlowContractInfo {
+  contractVersion: number;
+  provider: string;
+  packageVersion: string;
+  capabilities: unknown;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function contractCacheKey(command: string, environment: Record<string, string>): string {
+  return JSON.stringify([
+    command,
+    process.env["PATH"] ?? "",
+    process.env["PATHEXT"] ?? "",
+    Object.entries(environment).sort(([left], [right]) => left.localeCompare(right))
+  ]);
+}
+
+function parseContractInfo(stdout: string, processExitCode: number): FlowContractInfo {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout) as unknown;
+  } catch {
+    throw new IntegrationError("zigma-flow contract-info returned invalid JSON", {
+      stdoutTail: stdout.slice(-4_000),
+      exitCode: processExitCode
+    });
+  }
+  if (!isRecord(parsed)) {
+    throw new IntegrationError("zigma-flow contract-info must return an object", { exitCode: processExitCode });
+  }
+  const info = parsed as unknown as FlowContractInfo;
+  if (info.contractVersion !== FLOW_CONTRACT_VERSION) {
+    throw new IntegrationError(
+      `zigma-flow contract version mismatch: expected ${FLOW_CONTRACT_VERSION}, got ${String(info.contractVersion)}`,
+      { contractVersion: info.contractVersion, expectedVersion: FLOW_CONTRACT_VERSION }
+    );
+  }
+  if (info.provider !== FLOW_PROVIDER) {
+    throw new IntegrationError(
+      `zigma-flow provider mismatch: expected ${FLOW_PROVIDER}, got ${String(info.provider)}`,
+      { provider: info.provider, expectedProvider: FLOW_PROVIDER }
+    );
+  }
+  // Retain the provider's package version in the cached handshake for
+  // diagnostics, but do not treat a patch/minor package release as a protocol
+  // incompatibility. Provider identity, contract version, and capabilities
+  // are the compatibility boundary.
+  if (typeof info.packageVersion !== "string" || !info.packageVersion.trim()) {
+    throw new IntegrationError("zigma-flow contract-info packageVersion must be a non-empty string", {
+      packageVersion: info.packageVersion
+    });
+  }
+  if (!Array.isArray(info.capabilities) || !info.capabilities.every((item) => typeof item === "string")) {
+    throw new IntegrationError("zigma-flow contract-info capabilities must be a string array");
+  }
+  const missingCapabilities = REQUIRED_FLOW_CAPABILITIES.filter(
+    (capability) => !(info.capabilities as string[]).includes(capability)
+  );
+  if (missingCapabilities.length > 0) {
+    throw new IntegrationError("zigma-flow is missing required provider capabilities", {
+      missingCapabilities,
+      requiredCapabilities: [...REQUIRED_FLOW_CAPABILITIES]
+    });
+  }
+  if (processExitCode !== 0) {
+    throw new IntegrationError("zigma-flow contract-info command failed", { exitCode: processExitCode });
+  }
+  return info;
 }
 
 function parseInvokeJson(stdout: string, processExitCode: number): FlowStartResult {
@@ -113,30 +194,72 @@ function assertCommandJson(stdout: string, processExitCode: number, command: str
 
 /** Exported for testing */
 export function buildContextFilePayload(request: FlowStartRequest): Record<string, unknown> {
+  if (!request.permissionSnapshotId.trim() || !request.integrityHash.trim()) {
+    throw new IntegrationError("zigma-flow CallerContextV1 requires permission snapshot evidence");
+  }
   return {
-    permissionSnapshotId: request.permissionSnapshotId ?? null,
-    integrityHash: request.integrityHash ?? null,
+    contractVersion: FLOW_CONTRACT_VERSION,
+    actor: request.callerContext.actor,
     capabilities: request.callerContext.capabilities,
     constraints: {
-      allowedRepos: request.callerContext.constraints.repositoryIds,
-      allowedBranches: request.callerContext.constraints.branchPatterns,
-      maxRunDurationMs: request.callerContext.constraints.maxRunDurationMs ?? null
+      repositoryIds: request.callerContext.constraints.repositoryIds,
+      workflowRefs: request.callerContext.constraints.workflowRefs,
+      toolNames: request.callerContext.constraints.toolNames,
+      branchPatterns: request.callerContext.constraints.branchPatterns,
+      ...(request.callerContext.constraints.maxRunDurationMs !== undefined
+        ? { maxRunDurationMs: request.callerContext.constraints.maxRunDurationMs }
+        : {}),
+      ...(request.callerContext.constraints.expiresAt !== undefined
+        ? { expiresAt: request.callerContext.constraints.expiresAt }
+        : {})
     },
     source: request.callerContext.source,
-    coreCallbackUrl: request.coreCallbackUrl,
-    actor: request.callerContext.actor,
-    flowRunId: request.flowRunId,
     taskId: request.taskId,
+    flowRunId: request.flowRunId,
+    projectId: request.projectId,
+    permissionSnapshotId: request.permissionSnapshotId,
+    integrityHash: request.integrityHash,
     ...(request.operationId ? { operationId: request.operationId } : {}),
     ...(request.callbackCorrelationId ? { callbackCorrelationId: request.callbackCorrelationId } : {}),
     ...(request.repository ? { repository: request.repository } : {}),
     ...(request.baseRef ? { baseRef: request.baseRef } : {}),
-    ...(request.workspacePolicy ? { workspacePolicy: request.workspacePolicy } : {})
+    ...(request.workspacePolicy ? { workspacePolicy: request.workspacePolicy } : {}),
+    ...(request.coreCallbackUrl ? { coreCallbackUrl: request.coreCallbackUrl } : {})
   };
 }
 
 export class LocalCliFlowExecutor implements FlowExecutor {
+  private readonly contractCache = new Map<string, Promise<FlowContractInfo>>();
+
+  private async ensureCompatibleProvider(
+    command: string,
+    timeoutMs: number,
+    environment: Record<string, string>
+  ): Promise<void> {
+    const key = contractCacheKey(command, environment);
+    let pending = this.contractCache.get(key);
+    if (!pending) {
+      pending = (async () => {
+        const result = await execa(command, ["contract-info", "--json"], {
+          env: { ...process.env, ...environment },
+          timeout: timeoutMs,
+          reject: false,
+          all: true
+        });
+        return parseContractInfo(result.stdout ?? result.all ?? "", result.exitCode ?? 1);
+      })();
+      this.contractCache.set(key, pending);
+      pending.catch(() => this.contractCache.delete(key));
+    }
+    await pending;
+  }
+
+  async preflight(context: { command: string; timeoutMs: number; environment: Record<string, string> }): Promise<void> {
+    await this.ensureCompatibleProvider(context.command, context.timeoutMs, context.environment);
+  }
+
   async start(request: FlowStartRequest): Promise<FlowStartResult> {
+    await this.ensureCompatibleProvider(request.command, request.timeoutMs, request.environment);
     const contextFilePath = join(tmpdir(), `zigma-ctx-${request.flowRunId}.json`);
 
     const args = [
@@ -187,6 +310,7 @@ export class LocalCliFlowExecutor implements FlowExecutor {
   }
 
   async decideGate(request: FlowGateDecisionRequest): Promise<void> {
+    await this.ensureCompatibleProvider(request.command, request.timeoutMs, request.environment);
     const args = [
       "--cwd",
       request.projectRoot,
@@ -212,6 +336,7 @@ export class LocalCliFlowExecutor implements FlowExecutor {
   }
 
   async cancel(request: FlowCancelRequest): Promise<void> {
+    await this.ensureCompatibleProvider(request.command, request.timeoutMs, request.environment);
     const result = await execa(request.command, [
       "--cwd",
       request.projectRoot,

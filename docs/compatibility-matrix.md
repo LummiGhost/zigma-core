@@ -29,8 +29,9 @@ Core adapter 可使用的能力，不提前声称 durable execution、可靠事�
   level，并记录首个包含它的发布版本。
 - Core 当前尚无 Git release tag。`0.1.0` 是 source/package baseline；对外发布
   前，release job 必须把最终 M0 merge commit 与包版本绑定。
-- 包版本满足下限仍不充分。进程响应的契约版本和请求所需 capability 必须同时
-  匹配，否则在任何外部副作用前失败。
+- 表中的 package version 是已验证的发布基线和诊断信息，不是 Core admission 的
+  精确或范围比较。进程响应的 provider identity、契约版本和请求所需 capability
+  必须同时匹配，否则在任何外部副作用前失败。
 
 ### 1.1 Runtime 下限
 
@@ -179,11 +180,11 @@ closed。重复清理已清理 workspace 也可能得到该结果；M0 宁可要
 | 契约 | Provider owner 与当前测试 | Consumer owner 与当前测试 | 缺口/去向 |
 | --- | --- | --- | --- |
 | Flow invoke v1 envelope | Flow `tests/commands/invoke-json.test.ts` | Core `tests/adapters/local-cli-flow.test.ts` | process exit/JSON 对齐：M1 `invoke-terminal-contract.test.ts` |
-| Flow context file | Flow `tests/commands/context-file.test.ts` | Core `buildContextFilePayload` tests | secrets/large payload + real CLI：M2 `flow-context-adapter.contract.test.ts` |
+| Flow context file | Flow `tests/commands/context-file.test.ts` | Core `buildContextFilePayload` and `m0-real-cli.contract.test.ts` | real CLI gate proves canonical context is accepted and frozen; secrets/large payload remain M4 coverage |
 | Flow resume/abort command | Flow `tests/commands/resume-json.test.ts`, `abort-json.test.ts` | Core `LocalCliFlowExecutor command contracts` | out-of-process termination ack：M1/M2 `abort-process-tree.contract.test.ts` |
 | Flow platform events | Flow `tests/events/platformEvent.test.ts` | Core `tests/core-service.test.ts` correlated callback/dedupe cases | M4 增加真实跨进程投递 soak |
 | Workspace envelope/create/bind | Workspace types plus `tests/core/workspace-dogfood.test.ts` real Git behavior | Core `tests/adapters/zigma-workspace-cli.test.ts` | CLI black-box provider：M3 `tests/cli/platform-contract.test.ts` |
-| Workspace diff/snapshot | Workspace `tests/core/diff.test.ts`, `workspace-dogfood.test.ts` | Core Workspace adapter test fixture；真实 CLI consumer 尚缺 | M2/M3 `workspace-evidence.contract.test.ts` |
+| Workspace diff/snapshot | Workspace `tests/core/diff.test.ts`, `workspace-dogfood.test.ts` | Core adapter fixtures and `m0-real-cli.contract.test.ts` | dedicated Core gate rebuilds sibling source and verifies emitted artifact digests; M3 adds provider-owned CLI matrix |
 | Workspace lock/lease/reconcile | Workspace `tests/core/contracts.test.ts`, `contracts-windows.test.ts` | 无 M0 consumer；M0 不启用 | M3 `workspace-lease-adapter.contract.test.ts` |
 | Workspace factual cleanup | Workspace `contracts.test.ts`, `contracts-windows.test.ts` | Core cleanup `removed` fail-closed tests | stable strict CLI：M3 `workspace-cleanup.contract.test.ts` |
 | Core profile policy v1 | Core `tests/execution-profile-policy.test.ts`, `tests/api.test.ts` | Core API/CLI clients | Core 20-command admission、fencing、restart/retry tests |
@@ -211,8 +212,10 @@ rollback、幂等冲突、20-command/capacity-4、stale fencing、异步返回�
 - `capacity-admission.integration.test.ts`: global/project/repository/backend 原子预留。
 - `command-idempotency.crashpoints.test.ts`: persistence/invoke/ack 每个 crash point。
 - `flow-event-consumer.contract.test.ts`: duplicate event id 只产生一次 projection/audit。
-- `flow-context-adapter.contract.test.ts`: 真实 Flow CLI fixture 和版本拒绝。
-- `workspace-evidence.contract.test.ts`: 真实 Workspace CLI diff/snapshot fixture。
+- `tests/adapters/m0-real-cli.contract.test.ts`: 真实 Flow CLI accepts/freezes
+  `CallerContextV1`，真实 Workspace CLI diff/snapshot artifacts are digest-verified，
+  unknown version and post-emission tamper fail closed. `npm run test:m0-cross-repo`
+  rebuilds source checkouts first; CI pins Flow `b46701c` and Workspace `a5e2d8c`.
 
 ### M3 — Workspace isolation
 
@@ -279,8 +282,9 @@ rollback、幂等冲突、20-command/capacity-4、stale fencing、异步返回�
 
 不支持的组合包括：
 
-- Flow `<0.8.12` 或 invoke contract 非 1；
-- Workspace `<0.1.5`、缺少 `contract_version: 1` 或返回非 envelope pending 数据；
+- Flow 不声明 `zigma-flow` provider、contract version `1` 或 M0 capabilities；
+- Workspace 不声明 `zigma-workspace` provider、`contract_version: 1`、完整 M0
+  capabilities，或返回非 envelope pending 数据；
 - 要求 reliable events 却只配置 best-effort `--event-file`；
 - 要求强隔离却只依赖 manifest/read-only Git 标记；
 - 未实现 M2 durable command 却把自动重试当作 exactly-once；
