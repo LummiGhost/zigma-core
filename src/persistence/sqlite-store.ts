@@ -1080,6 +1080,11 @@ export class SqliteStore {
     return row ? this.mapExecutionLease(row) : undefined;
   }
 
+  listExecutionLeases(): ExecutionLease[] {
+    const rows = this.db.prepare("SELECT * FROM execution_leases ORDER BY acquired_at ASC, command_id ASC").all() as Record<string, unknown>[];
+    return rows.map((row) => this.mapExecutionLease(row));
+  }
+
   private updateExecutionLease(lease: ExecutionLease): void {
     this.db.prepare("UPDATE execution_leases SET owner_id=?, fencing_token=?, status=?, renewed_at=?, expires_at=?, released_at=? WHERE command_id=?").run(
       lease.ownerId, lease.fencingToken, lease.status, lease.renewedAt, lease.expiresAt, lease.releasedAt ?? null, lease.commandId

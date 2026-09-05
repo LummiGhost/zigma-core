@@ -14,6 +14,12 @@ export interface AsyncExecutionRuntimeOptions {
   leaseDurationMs?: number;
   heartbeatIntervalMs?: number;
   pollIntervalMs?: number;
+  /**
+   * Maximum number of in-process workers that may deliver independent outbox
+   * commands concurrently. Persisted admission remains the cross-process
+   * capacity authority.
+   */
+  workerConcurrency?: number;
   policyFor(commandId: string): ExecutionPolicy;
   /** Fault-injection/telemetry seam. Throw DispatchCrashpointError to emulate process loss. */
   onPhase?(phase: DispatchExecutionPhase, commandId: string): void | Promise<void>;
@@ -25,6 +31,7 @@ export class AsyncExecutionRuntime {
   private readonly leaseDurationMs: number;
   private readonly heartbeatIntervalMs: number;
   private readonly pollIntervalMs: number;
+  private readonly workerConcurrency: number;
 
   constructor(
     private readonly store: SqliteStore,
@@ -35,6 +42,12 @@ export class AsyncExecutionRuntime {
     this.leaseDurationMs = options.leaseDurationMs ?? 30_000;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? Math.max(10, Math.floor(this.leaseDurationMs / 3));
     this.pollIntervalMs = options.pollIntervalMs ?? 250;
+    // Match the default persisted global capacity. Deployments with a smaller
+    // policy remain safe because admission is atomic and authoritative.
+    this.workerConcurrency = options.workerConcurrency ?? 4;
+    if (!Number.isSafeInteger(this.workerConcurrency) || this.workerConcurrency < 1) {
+      throw new Error("workerConcurrency must be a positive integer");
+    }
   }
 
   start(): void {
@@ -59,47 +72,68 @@ export class AsyncExecutionRuntime {
 
       // The outbox is the only source for new provider deliveries. Command
       // status is a projection and is never enumerated as a dispatch queue.
-      const now = this.admission.now();
-      for (const due of this.store.listDueOutboxDeliveries(now)) {
-        const command = this.store.getExecutionCommand(due.aggregateId);
-        if (command.status !== "pending") continue;
-        const admitted = this.admission.admit(
-          command.id,
-          this.options.ownerId,
-          this.options.policyFor(command.id),
-          this.leaseDurationMs
-        );
-        if (admitted.outcome !== "acquired") continue;
-
-        const fence = executionFence(admitted.lease);
-        await this.phase("lease-acquired", command.id);
-        const claimed = this.store.claimOutboxDelivery(
-          due.id,
-          fence,
-          admitted.lease.renewedAt,
-          admitted.lease.expiresAt
-        );
-        if (!claimed) {
-          this.admission.release(fence);
-          continue;
+      const due = this.store.listDueOutboxDeliveries(this.admission.now());
+      let next = 0;
+      const workers = Array.from({ length: Math.min(this.workerConcurrency, due.length) }, async () => {
+        let workerDispatched = 0;
+        while (next < due.length) {
+          const delivery = due[next++];
+          if (!delivery) break;
+          workerDispatched += await this.processDueDelivery(delivery);
         }
-        await this.phase("outbox-claimed", command.id);
-
-        try {
-          await this.withHeartbeat(fence, () => this.core.dispatchExecutionCommand(command.id, {
-            fence,
-            onPhase: (phase) => this.phase(phase, command.id)
-          }));
-          dispatched += 1;
-          await this.finalizeDelivery(command.id, claimed, fence);
-        } catch (error) {
-          if (error instanceof DispatchCrashpointError) throw error;
-          this.handleDispatchFailure(command.id, claimed, fence, error);
-        }
-      }
+        return workerDispatched;
+      });
+      // A crashpoint from one worker must not make the next poll overlap a
+      // still-running sibling. Wait for every worker before clearing `running`.
+      const settled = await Promise.allSettled(workers);
+      const rejected = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (rejected) throw rejected.reason;
+      dispatched = settled.reduce(
+        (total, result) => total + (result.status === "fulfilled" ? result.value : 0),
+        0
+      );
       return dispatched;
     } finally {
       this.running = false;
+    }
+  }
+
+  private async processDueDelivery(due: OutboxDelivery): Promise<number> {
+    const command = this.store.getExecutionCommand(due.aggregateId);
+    if (command.status !== "pending") return 0;
+    const admitted = this.admission.admit(
+      command.id,
+      this.options.ownerId,
+      this.options.policyFor(command.id),
+      this.leaseDurationMs
+    );
+    if (admitted.outcome !== "acquired") return 0;
+
+    const fence = executionFence(admitted.lease);
+    await this.phase("lease-acquired", command.id);
+    const claimed = this.store.claimOutboxDelivery(
+      due.id,
+      fence,
+      admitted.lease.renewedAt,
+      admitted.lease.expiresAt
+    );
+    if (!claimed) {
+      this.admission.release(fence);
+      return 0;
+    }
+    await this.phase("outbox-claimed", command.id);
+
+    try {
+      await this.withHeartbeat(fence, () => this.core.dispatchExecutionCommand(command.id, {
+        fence,
+        onPhase: (phase) => this.phase(phase, command.id)
+      }));
+      await this.finalizeDelivery(command.id, claimed, fence);
+      return 1;
+    } catch (error) {
+      if (error instanceof DispatchCrashpointError) throw error;
+      this.handleDispatchFailure(command.id, claimed, fence, error);
+      return 0;
     }
   }
 
