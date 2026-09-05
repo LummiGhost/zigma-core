@@ -2,7 +2,16 @@ import { writeFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execa } from "execa";
-import type { FlowCancelRequest, FlowExecutor, FlowGateDecisionRequest, FlowStartRequest, FlowStartResult } from "../contracts/ports.js";
+import type {
+  FlowCancelRequest,
+  FlowCancelResult,
+  FlowExecutor,
+  FlowGateDecisionRequest,
+  FlowReconcileRequest,
+  FlowReconcileResult,
+  FlowStartRequest,
+  FlowStartResult
+} from "../contracts/ports.js";
 import type { FlowRunStatus } from "../contracts/schemas.js";
 import { IntegrationError } from "../domain/errors.js";
 
@@ -13,6 +22,7 @@ const REQUIRED_FLOW_CAPABILITIES = [
   "invoke-json-v1",
   "context-freeze-v1"
 ] as const;
+const FLOW_INSPECT_CAPABILITY = "run-inspect-v1";
 
 const VALID_STATUSES = new Set<string>([
   "created",
@@ -166,7 +176,7 @@ function parseInvokeJson(stdout: string, processExitCode: number): FlowStartResu
   };
 }
 
-function assertCommandJson(stdout: string, processExitCode: number, command: string): void {
+function parseCommandJson(stdout: string, processExitCode: number, command: string): FlowCommandEnvelope {
   let envelope: FlowCommandEnvelope;
   try {
     envelope = JSON.parse(stdout) as FlowCommandEnvelope;
@@ -190,6 +200,96 @@ function assertCommandJson(stdout: string, processExitCode: number, command: str
       runId: envelope.runId
     });
   }
+  return envelope;
+}
+
+function inspectReconciliationResult(
+  stdout: string,
+  processExitCode: number,
+  request: FlowReconcileRequest
+): FlowReconcileResult {
+  let envelope: FlowCommandEnvelope;
+  try {
+    envelope = JSON.parse(stdout) as FlowCommandEnvelope;
+  } catch {
+    return {
+      outcome: "unknown",
+      reason: "zigma-flow inspect returned invalid JSON",
+      metadata: { stdoutTail: stdout.slice(-4_000), exitCode: processExitCode }
+    };
+  }
+  if (envelope.contractVersion !== FLOW_CONTRACT_VERSION || envelope.command !== "inspect") {
+    return {
+      outcome: "unknown",
+      reason: "zigma-flow inspect returned an incompatible command envelope",
+      metadata: { contractVersion: envelope.contractVersion, command: envelope.command, exitCode: processExitCode }
+    };
+  }
+  if (processExitCode !== 0 || envelope.status !== "success") {
+    if (envelope.error?.code === "RUN_NOT_FOUND") {
+      return {
+        outcome: "not_found",
+        // A missing run directory does not prove an interrupted invocation was
+        // fenced. Core must keep the command reconciling rather than replay it.
+        safeToRedispatch: false,
+        metadata: { providerCode: envelope.error.code, runId: envelope.runId }
+      };
+    }
+    return {
+      outcome: "unknown",
+      reason: envelope.error?.message ?? "zigma-flow inspect command failed",
+      metadata: { providerCode: envelope.error?.code, runId: envelope.runId, exitCode: processExitCode }
+    };
+  }
+  const reconciliation = envelope.data?.["reconciliation"];
+  if (!isRecord(reconciliation) || reconciliation["contractVersion"] !== 1) {
+    return {
+      outcome: "unknown",
+      reason: "zigma-flow inspect omitted reconciliation V1 evidence",
+      metadata: { runId: envelope.runId }
+    };
+  }
+  const callerContext = reconciliation["callerContext"];
+  if (
+    !isRecord(callerContext)
+    || callerContext["state"] !== "accepted"
+    || callerContext["operationId"] !== request.operationId
+  ) {
+    return {
+      outcome: "unknown",
+      reason: "zigma-flow inspect could not prove operation correlation from a frozen caller context",
+      metadata: { reconciliation }
+    };
+  }
+  const lifecycle = reconciliation["lifecycle"];
+  if (!isRecord(lifecycle) || typeof lifecycle["status"] !== "string") {
+    return {
+      outcome: "unknown",
+      reason: "zigma-flow inspect omitted lifecycle evidence",
+      metadata: { reconciliation }
+    };
+  }
+  const status = lifecycle["status"];
+  if (!["running", "awaiting_human", "completed", "failed", "cancelled"].includes(status)) {
+    return {
+      outcome: "unknown",
+      reason: `zigma-flow inspect reported an unsupported lifecycle status: ${status}`,
+      metadata: { reconciliation }
+    };
+  }
+  const invocation = reconciliation["invocation"];
+  const quiescent = isRecord(invocation)
+    && invocation["state"] === "quiescent"
+    && invocation["quiescent"] === true;
+  return {
+    outcome: "found",
+    externalRunId: typeof reconciliation["externalRunId"] === "string"
+      ? reconciliation["externalRunId"]
+      : envelope.runId,
+    status: status as FlowRunStatus,
+    quiescent,
+    metadata: { reconciliation }
+  };
 }
 
 /** Exported for testing */
@@ -220,6 +320,7 @@ export function buildContextFilePayload(request: FlowStartRequest): Record<strin
     permissionSnapshotId: request.permissionSnapshotId,
     integrityHash: request.integrityHash,
     ...(request.operationId ? { operationId: request.operationId } : {}),
+    ...(request.executionFence ? { executionFence: request.executionFence } : {}),
     ...(request.callbackCorrelationId ? { callbackCorrelationId: request.callbackCorrelationId } : {}),
     ...(request.repository ? { repository: request.repository } : {}),
     ...(request.baseRef ? { baseRef: request.baseRef } : {}),
@@ -235,7 +336,7 @@ export class LocalCliFlowExecutor implements FlowExecutor {
     command: string,
     timeoutMs: number,
     environment: Record<string, string>
-  ): Promise<void> {
+  ): Promise<FlowContractInfo> {
     const key = contractCacheKey(command, environment);
     let pending = this.contractCache.get(key);
     if (!pending) {
@@ -251,7 +352,7 @@ export class LocalCliFlowExecutor implements FlowExecutor {
       this.contractCache.set(key, pending);
       pending.catch(() => this.contractCache.delete(key));
     }
-    await pending;
+    return pending;
   }
 
   async preflight(context: { command: string; timeoutMs: number; environment: Record<string, string> }): Promise<void> {
@@ -332,10 +433,10 @@ export class LocalCliFlowExecutor implements FlowExecutor {
       timeout: request.timeoutMs,
       env: { ...process.env, ...request.environment }
     });
-    assertCommandJson(result.stdout ?? result.all ?? "", result.exitCode ?? 1, "resume");
+    parseCommandJson(result.stdout ?? result.all ?? "", result.exitCode ?? 1, "resume");
   }
 
-  async cancel(request: FlowCancelRequest): Promise<void> {
+  async cancel(request: FlowCancelRequest): Promise<FlowCancelResult> {
     await this.ensureCompatibleProvider(request.command, request.timeoutMs, request.environment);
     const result = await execa(request.command, [
       "--cwd",
@@ -352,6 +453,54 @@ export class LocalCliFlowExecutor implements FlowExecutor {
       timeout: request.timeoutMs,
       env: { ...process.env, ...request.environment }
     });
-    assertCommandJson(result.stdout ?? result.all ?? "", result.exitCode ?? 1, "abort");
+    const envelope = parseCommandJson(result.stdout ?? result.all ?? "", result.exitCode ?? 1, "abort");
+    if (envelope.data?.["quiescent"] !== true) {
+      throw new IntegrationError("zigma-flow abort did not acknowledge quiescence", {
+        runId: envelope.runId,
+        quiescent: envelope.data?.["quiescent"]
+      });
+    }
+    const ownerStatus = envelope.data["ownerStatus"];
+    const status = ownerStatus === "completed" || ownerStatus === "failed" || ownerStatus === "cancelled"
+      ? ownerStatus
+      : "cancelled";
+    return {
+      externalRunId: envelope.runId,
+      status,
+      quiescent: true,
+      metadata: envelope.data
+    };
+  }
+
+  async reconcile(request: FlowReconcileRequest): Promise<FlowReconcileResult> {
+    const contract = await this.ensureCompatibleProvider(request.command, request.timeoutMs, request.environment);
+    if (!(contract.capabilities as string[]).includes(FLOW_INSPECT_CAPABILITY)) {
+      return {
+        outcome: "unsupported",
+        reason: `zigma-flow does not advertise ${FLOW_INSPECT_CAPABILITY}`,
+        metadata: { capabilities: contract.capabilities }
+      };
+    }
+    if (!request.externalRunId) {
+      return {
+        outcome: "unknown",
+        reason: "Core has no external Flow run id to inspect",
+        metadata: { operationId: request.operationId }
+      };
+    }
+    const result = await execa(request.command, [
+      "--cwd",
+      request.projectRoot,
+      "inspect",
+      "--run",
+      request.externalRunId,
+      "--json"
+    ], {
+      reject: false,
+      all: true,
+      timeout: request.timeoutMs,
+      env: { ...process.env, ...request.environment }
+    });
+    return inspectReconciliationResult(result.stdout ?? result.all ?? "", result.exitCode ?? 1, request);
   }
 }

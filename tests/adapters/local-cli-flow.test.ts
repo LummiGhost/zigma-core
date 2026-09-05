@@ -350,6 +350,62 @@ describe("buildContextFilePayload", () => {
 });
 
 describe("LocalCliFlowExecutor command contracts", () => {
+  it("fails closed when the provider does not advertise inspect capability", async () => {
+    await expect(executor.reconcile({
+      operationId: "command-1",
+      executionFence: { commandId: "command-1", leaseId: "lease-1", ownerId: "worker-1", fencingToken: 1 },
+      externalRunId: "run-1",
+      command: "zigma-flow",
+      projectRoot: "/tmp/project",
+      timeoutMs: 60_000,
+      environment: {}
+    })).resolves.toMatchObject({ outcome: "unsupported" });
+    expect(mockExeca).toHaveBeenCalledTimes(1);
+  });
+
+  it("negotiates run-inspect-v1 and accepts only correlated quiescent evidence", async () => {
+    mockExeca.mockReset();
+    mockExeca.mockResolvedValueOnce(contractInfo({
+      capabilities: ["caller-context-v1", "invoke-json-v1", "context-freeze-v1", "run-inspect-v1"]
+    }));
+    mockExeca.mockResolvedValueOnce({
+      stdout: JSON.stringify({
+        contractVersion: 1,
+        command: "inspect",
+        status: "success",
+        runId: "run-1",
+        data: {
+          reconciliation: {
+            contractVersion: 1,
+            externalRunId: "run-1",
+            lifecycle: { status: "cancelled", terminal: true },
+            invocation: { state: "quiescent", quiescent: true },
+            callerContext: { state: "accepted", operationId: "command-1" }
+          }
+        }
+      }),
+      exitCode: 0
+    });
+
+    await expect(executor.reconcile({
+      operationId: "command-1",
+      executionFence: { commandId: "command-1", leaseId: "lease-1", ownerId: "worker-1", fencingToken: 1 },
+      externalRunId: "run-1",
+      command: "zigma-flow",
+      projectRoot: "/tmp/project",
+      timeoutMs: 60_000,
+      environment: {}
+    })).resolves.toMatchObject({
+      outcome: "found",
+      externalRunId: "run-1",
+      status: "cancelled",
+      quiescent: true
+    });
+    expect(mockExeca.mock.lastCall?.[1]).toEqual([
+      "--cwd", "/tmp/project", "inspect", "--run", "run-1", "--json"
+    ]);
+  });
+
   it("uses the versioned resume JSON command for gate decisions", async () => {
     mockExeca.mockResolvedValueOnce({
       stdout: commandEnvelope("resume"),
@@ -382,20 +438,21 @@ describe("LocalCliFlowExecutor command contracts", () => {
   });
 
   it("uses abort --run with a structured reason and JSON response", async () => {
+    const response = commandEnvelope("abort", { data: { quiescent: true, ownerStatus: "cancelled" } });
     mockExeca.mockResolvedValueOnce({
-      stdout: commandEnvelope("abort"),
-      all: commandEnvelope("abort"),
+      stdout: response,
+      all: response,
       exitCode: 0
     });
 
-    await executor.cancel({
+    await expect(executor.cancel({
       command: "zigma-flow",
       externalRunId: "run-1",
       projectRoot: "/tmp/project",
       reason: "user-requested",
       timeoutMs: 60_000,
       environment: {}
-    });
+    })).resolves.toMatchObject({ externalRunId: "run-1", status: "cancelled", quiescent: true });
 
     expect(mockExeca.mock.lastCall?.[1]).toEqual([
       "--cwd",

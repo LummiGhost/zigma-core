@@ -6,7 +6,21 @@ import type {
   WorkspacePolicy
 } from "./schemas.js";
 
+/**
+ * Capacity-lease identity carried across every mutating provider boundary.
+ * Providers that advertise fencing support must reject a lower/stale token;
+ * Core also verifies the same token immediately before the call and on commit.
+ */
+export interface ExecutionLeaseFence {
+  commandId: string;
+  leaseId: string;
+  ownerId: string;
+  fencingToken: number;
+}
+
 export interface WorkspacePreparationRequest {
+  operationId?: string;
+  executionFence?: ExecutionLeaseFence;
   projectId: string;
   taskId: string;
   flowRunId: string;
@@ -39,6 +53,8 @@ export interface WorkspaceInvocationContext {
   command: string;
   timeoutMs: number;
   environment: Record<string, string>;
+  operationId?: string;
+  executionFence?: ExecutionLeaseFence;
 }
 
 export interface WorkspaceProvider {
@@ -52,6 +68,7 @@ export interface WorkspaceProvider {
 export interface FlowStartRequest {
   /** Stable Core operation identity used by Flow/Workspace for idempotent provider calls. */
   operationId?: string;
+  executionFence?: ExecutionLeaseFence;
   callbackCorrelationId?: string;
   command: string;
   projectId: string;
@@ -100,6 +117,8 @@ export interface FlowGateDecisionRequest {
 }
 
 export interface FlowCancelRequest {
+  operationId?: string;
+  executionFence?: ExecutionLeaseFence;
   command: string;
   externalRunId: string;
   projectRoot: string;
@@ -108,11 +127,53 @@ export interface FlowCancelRequest {
   environment: Record<string, string>;
 }
 
+export interface FlowCancelResult {
+  externalRunId: string;
+  status: "completed" | "failed" | "cancelled";
+  /** Provider-owned proof that children and writers have stopped. */
+  quiescent: boolean;
+  metadata: Record<string, unknown>;
+}
+
+export interface FlowReconcileRequest {
+  operationId: string;
+  executionFence: ExecutionLeaseFence;
+  externalRunId?: string;
+  command: string;
+  projectRoot: string;
+  timeoutMs: number;
+  environment: Record<string, string>;
+}
+
+export type FlowReconcileResult =
+  | {
+      outcome: "found";
+      externalRunId: string;
+      status: FlowRunStatus;
+      quiescent: boolean;
+      exitCode?: number;
+      summary?: string;
+      metadata: Record<string, unknown>;
+    }
+  | {
+      outcome: "not_found";
+      /** True only when the provider fenced the old invocation and guarantees retry safety. */
+      safeToRedispatch: boolean;
+      metadata: Record<string, unknown>;
+    }
+  | {
+      outcome: "unsupported" | "unknown";
+      reason: string;
+      metadata: Record<string, unknown>;
+    };
+
 export interface FlowExecutor {
   preflight(context: WorkspaceInvocationContext): Promise<void>;
   start(request: FlowStartRequest): Promise<FlowStartResult>;
   decideGate?(request: FlowGateDecisionRequest): Promise<void>;
-  cancel?(request: FlowCancelRequest): Promise<void>;
+  cancel?(request: FlowCancelRequest): Promise<FlowCancelResult>;
+  /** Optional until a provider advertises a versioned truth-query capability. */
+  reconcile?(request: FlowReconcileRequest): Promise<FlowReconcileResult>;
 }
 
 export interface Clock {

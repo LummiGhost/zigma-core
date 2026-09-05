@@ -30,8 +30,17 @@ export type GateStatus =
   | "cancelled";
 export type WorkspaceStatus = "preparing" | "ready" | "active" | "released" | "failed";
 export type EvidenceBundleStatus = "open" | "finalized" | "incomplete";
-export type ExecutionCommandStatus = "pending" | "leased" | "reconciling" | "dispatched" | "completed" | "failed" | "cancelled";
-export type OutboxDeliveryStatus = "pending" | "delivered" | "failed";
+export type ExecutionCommandStatus =
+  | "pending"
+  | "leased"
+  | "dispatching"
+  | "dispatched"
+  | "cancel_requested"
+  | "reconciling"
+  | "completed"
+  | "failed"
+  | "cancelled";
+export type OutboxDeliveryStatus = "pending" | "claimed" | "delivered" | "failed" | "cancelled";
 export type ExecutionLeaseStatus = "active" | "reconciling" | "released";
 
 export interface ExecutionProfile {
@@ -180,7 +189,11 @@ export interface ExecutionCommand {
   status: ExecutionCommandStatus;
   attempt: number;
   payload: Record<string, unknown>;
+  providerResponse?: Record<string, unknown>;
   lastError?: string;
+  dispatchStartedAt?: string;
+  cancelRequestedAt?: string;
+  cancelAcknowledgedAt?: string;
   createdAt: string;
   updatedAt: string;
   completedAt?: string;
@@ -196,6 +209,10 @@ export interface OutboxDelivery {
   availableAt: string;
   createdAt: string;
   updatedAt: string;
+  claimOwnerId?: string;
+  claimFencingToken?: number;
+  claimedAt?: string;
+  claimExpiresAt?: string;
   deliveredAt?: string;
   lastError?: string;
 }

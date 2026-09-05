@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type {
   Clock,
+  FlowCancelRequest,
+  FlowCancelResult,
   FlowExecutor,
   FlowGateDecisionRequest,
   FlowStartRequest,
@@ -12,8 +14,8 @@ import type {
   WorkspacePreparationRequest,
   WorkspaceProvider
 } from "../src/contracts/ports.js";
-import { CoreService } from "../src/application/core-service.js";
-import { ExecutionAdmissionService } from "../src/application/execution-admission.js";
+import { CoreService, DispatchCrashpointError, type DispatchExecutionPhase } from "../src/application/core-service.js";
+import { ExecutionAdmissionService, executionFence } from "../src/application/execution-admission.js";
 import { AsyncExecutionRuntime } from "../src/application/async-execution-runtime.js";
 import type { DecideHumanGateInput } from "../src/contracts/schemas.js";
 import { SqliteStore } from "../src/persistence/sqlite-store.js";
@@ -27,6 +29,27 @@ class FakeClock implements Clock {
   }
 }
 
+class ManualClock implements Clock {
+  private milliseconds = Date.UTC(2026, 6, 20, 0, 0, 0);
+
+  now(): string {
+    return new Date(this.milliseconds).toISOString();
+  }
+
+  advance(milliseconds: number): void {
+    this.milliseconds += milliseconds;
+  }
+}
+
+class TickingClock implements Clock {
+  private milliseconds = Date.UTC(2026, 6, 20, 0, 0, 0);
+
+  now(): string {
+    this.milliseconds += 10;
+    return new Date(this.milliseconds).toISOString();
+  }
+}
+
 class FakeIds implements IdGenerator {
   private value = 0;
   next(prefix: string): string {
@@ -37,6 +60,7 @@ class FakeIds implements IdGenerator {
 
 class FakeFlow implements FlowExecutor {
   readonly decisions: FlowGateDecisionRequest[] = [];
+  readonly cancellations: FlowCancelRequest[] = [];
   starts = 0;
   startBarrier?: Promise<void>;
 
@@ -59,6 +83,18 @@ class FakeFlow implements FlowExecutor {
   async decideGate(request: FlowGateDecisionRequest): Promise<void> {
     this.decisions.push(request);
     if (this.decisionError) throw this.decisionError;
+  }
+
+  cancelResult: FlowCancelResult = {
+    externalRunId: "zf-run-1",
+    status: "cancelled",
+    quiescent: true,
+    metadata: { engine: "fake" }
+  };
+
+  async cancel(request: FlowCancelRequest): Promise<FlowCancelResult> {
+    this.cancellations.push(request);
+    return this.cancelResult;
   }
 }
 
@@ -105,6 +141,7 @@ afterEach(() => {
 function setup(options?: {
   workspaceProvider?: WorkspaceProvider;
   executionMode?: "synchronous" | "asynchronous";
+  clock?: Clock;
   repositoryWritable?: boolean;
   workspacePolicy?: {
     provider: "zigma-workspace-cli" | "existing-directory" | "none";
@@ -117,7 +154,7 @@ function setup(options?: {
   const store = new SqliteStore(":memory:");
   stores.push(store);
   const flow = new FakeFlow();
-  const clock = new FakeClock();
+  const clock = options?.clock ?? new FakeClock();
   const ids = new FakeIds();
   const core = new CoreService({
     store,
@@ -238,7 +275,7 @@ describe("CoreService", () => {
     const dispatch = runtime.runOnce();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(flow.starts).toBe(1);
-    expect(store.getExecutionCommand(accepted.executionCommand!.id).status).toBe("dispatched");
+    expect(store.getExecutionCommand(accepted.executionCommand!.id).status).toBe("dispatching");
     releaseFlow();
     expect(await dispatch).toBe(1);
     expect(core.getTaskView(task.id)).toMatchObject({
@@ -264,7 +301,229 @@ describe("CoreService", () => {
     expect(core.getTask(task.id).status).toBe("cancelled");
   });
 
-  it("retries bounded pre-invocation failures without duplicating Flow", async () => {
+  it("does not ACK a claimed delivery until the provider response is durable", async () => {
+    const clock = new ManualClock();
+    const { core, flow, store, project, task, ids } = setup({ executionMode: "asynchronous", clock });
+    const accepted = await core.startTask(task.id, { ...startInput(), idempotencyKey: "crash-after-response" });
+    const runtime = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+      ownerId: "worker-crash-a",
+      leaseDurationMs: 1_000,
+      policyFor: () => store.getExecutionProfile(project.executionProfileId).executionPolicy,
+      onPhase: (phase) => {
+        if (phase === "provider-response-received") throw new DispatchCrashpointError(phase);
+      }
+    });
+
+    await expect(runtime.runOnce()).rejects.toBeInstanceOf(DispatchCrashpointError);
+    expect(flow.starts).toBe(1);
+    expect(store.getExecutionCommand(accepted.executionCommand!.id)).toMatchObject({ status: "dispatching" });
+    expect(store.getExecutionCommand(accepted.executionCommand!.id).providerResponse).toBeUndefined();
+    expect(store.listOutboxDeliveries()).toEqual([expect.objectContaining({ status: "claimed" })]);
+
+    // The response could have reached Flow just before the process died. With
+    // no inspect capability, restart must retain the command as ambiguous.
+    clock.advance(2_000);
+    const restarted = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+      ownerId: "worker-crash-b",
+      leaseDurationMs: 1_000,
+      policyFor: () => store.getExecutionProfile(project.executionProfileId).executionPolicy
+    });
+    expect(await restarted.runOnce()).toBe(0);
+    expect(flow.starts).toBe(1);
+    expect(store.getExecutionCommand(accepted.executionCommand!.id)).toMatchObject({
+      status: "reconciling",
+      lastError: expect.stringContaining("inspection capability")
+    });
+    expect(store.getExecutionLease(accepted.executionCommand!.id)?.status).toBe("reconciling");
+  });
+
+  it("recovers a crash before provider dispatch by resetting the claimed outbox delivery", async () => {
+    const clock = new ManualClock();
+    const { core, flow, store, project, task, ids } = setup({ executionMode: "asynchronous", clock });
+    const accepted = await core.startTask(task.id, { ...startInput(), idempotencyKey: "crash-after-claim" });
+    const crashing = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+      ownerId: "worker-claim-a",
+      leaseDurationMs: 1_000,
+      policyFor: () => store.getExecutionProfile(project.executionProfileId).executionPolicy,
+      onPhase: (phase) => {
+        if (phase === "outbox-claimed") throw new DispatchCrashpointError(phase);
+      }
+    });
+
+    await expect(crashing.runOnce()).rejects.toBeInstanceOf(DispatchCrashpointError);
+    expect(flow.starts).toBe(0);
+    expect(store.listOutboxDeliveries()).toEqual([expect.objectContaining({ status: "claimed" })]);
+
+    clock.advance(2_000);
+    const restarted = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+      ownerId: "worker-claim-b",
+      leaseDurationMs: 1_000,
+      policyFor: () => store.getExecutionProfile(project.executionProfileId).executionPolicy
+    });
+    // Reconciliation precedes the outbox scan in the same iteration, so an
+    // interrupted pre-dispatch claim can be reclaimed immediately and safely.
+    expect(await restarted.runOnce()).toBe(1);
+    expect(flow.starts).toBe(1);
+    expect(store.getExecutionCommand(accepted.executionCommand!.id).status).toBe("completed");
+  });
+
+  it("recovers a crash immediately after lease acquisition without invoking Flow", async () => {
+    const clock = new ManualClock();
+    const { core, flow, store, project, task, ids } = setup({ executionMode: "asynchronous", clock });
+    const accepted = await core.startTask(task.id, { ...startInput(), idempotencyKey: "crash-after-lease" });
+    const crashing = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+      ownerId: "worker-lease-a",
+      leaseDurationMs: 1_000,
+      policyFor: () => store.getExecutionProfile(project.executionProfileId).executionPolicy,
+      onPhase: (phase) => {
+        if (phase === "lease-acquired") throw new DispatchCrashpointError(phase);
+      }
+    });
+
+    await expect(crashing.runOnce()).rejects.toBeInstanceOf(DispatchCrashpointError);
+    expect(flow.starts).toBe(0);
+    expect(store.getExecutionCommand(accepted.executionCommand!.id).status).toBe("leased");
+    expect(store.listOutboxDeliveries()).toEqual([expect.objectContaining({ status: "pending" })]);
+
+    clock.advance(2_000);
+    const restarted = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+      ownerId: "worker-lease-b",
+      leaseDurationMs: 1_000,
+      policyFor: () => store.getExecutionProfile(project.executionProfileId).executionPolicy
+    });
+    expect(await restarted.runOnce()).toBe(1);
+    expect(flow.starts).toBe(1);
+    expect(store.getExecutionCommand(accepted.executionCommand!.id).status).toBe("completed");
+  });
+
+  it("finishes an already durable provider result after crash points before and after outbox ACK", async () => {
+    const phases: DispatchExecutionPhase[] = ["provider-result-persisted", "outbox-acknowledged"];
+    for (const phase of phases) {
+      const clock = new ManualClock();
+      const { core, flow, store, project, task, ids } = setup({ executionMode: "asynchronous", clock });
+      const accepted = await core.startTask(task.id, { ...startInput(), idempotencyKey: `crash-${phase}` });
+      const crashing = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+        ownerId: `worker-${phase}-a`,
+        leaseDurationMs: 1_000,
+        policyFor: () => store.getExecutionProfile(project.executionProfileId).executionPolicy,
+        onPhase: (current) => {
+          if (current === phase) throw new DispatchCrashpointError(current);
+        }
+      });
+
+      await expect(crashing.runOnce()).rejects.toBeInstanceOf(DispatchCrashpointError);
+      expect(store.getExecutionCommand(accepted.executionCommand!.id)).toMatchObject({ status: "completed", providerResponse: expect.any(Object) });
+      if (phase === "provider-result-persisted") {
+        expect(store.listOutboxDeliveries()).toEqual([expect.objectContaining({ status: "claimed" })]);
+      } else {
+        expect(store.listOutboxDeliveries()).toEqual([expect.objectContaining({ status: "delivered" })]);
+      }
+
+      clock.advance(2_000);
+      const restarted = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+        ownerId: `worker-${phase}-b`,
+        leaseDurationMs: 1_000,
+        policyFor: () => store.getExecutionProfile(project.executionProfileId).executionPolicy
+      });
+      expect(await restarted.runOnce()).toBe(0);
+      expect(flow.starts).toBe(1);
+      expect(store.listOutboxDeliveries()).toEqual([expect.objectContaining({ status: "delivered" })]);
+      expect(store.getExecutionLease(accepted.executionCommand!.id)?.status).toBe("released");
+    }
+  });
+
+  it("ACKs a durably recorded provider failure instead of treating it as an outbox delivery failure", async () => {
+    const { core, flow, store, project, task, clock, ids } = setup({ executionMode: "asynchronous" });
+    flow.result = { externalRunId: "zf-failed", status: "failed", exitCode: 1, metadata: { reason: "workflow failed" } };
+    const accepted = await core.startTask(task.id, { ...startInput(), idempotencyKey: "provider-failure" });
+    const runtime = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+      ownerId: "worker-provider-failure",
+      policyFor: () => store.getExecutionProfile(project.executionProfileId).executionPolicy
+    });
+
+    expect(await runtime.runOnce()).toBe(1);
+    expect(store.getExecutionCommand(accepted.executionCommand!.id)).toMatchObject({
+      status: "failed",
+      providerResponse: expect.objectContaining({ status: "failed" })
+    });
+    expect(store.listOutboxDeliveries()).toEqual([expect.objectContaining({ status: "delivered" })]);
+    expect(core.getTask(task.id).status).toBe("failed");
+    expect(store.getExecutionLease(accepted.executionCommand!.id)?.status).toBe("released");
+  });
+
+  it("heartbeats a live lease and rejects stale owners after reconciliation takeover", async () => {
+    const clock = new TickingClock();
+    const { core, flow, store, project, task, ids } = setup({ executionMode: "asynchronous", clock });
+    let releaseFlow!: () => void;
+    flow.startBarrier = new Promise<void>((resolve) => { releaseFlow = resolve; });
+    const accepted = await core.startTask(task.id, { ...startInput(), idempotencyKey: "heartbeat" });
+    const runtime = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+      ownerId: "worker-heartbeat",
+      leaseDurationMs: 60_000,
+      heartbeatIntervalMs: 1,
+      policyFor: () => store.getExecutionProfile(project.executionProfileId).executionPolicy
+    });
+    const dispatch = runtime.runOnce();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(flow.starts).toBe(1);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    const heartbeatLease = store.getExecutionLease(accepted.executionCommand!.id)!;
+    expect(heartbeatLease.renewedAt).not.toBe(heartbeatLease.acquiredAt);
+    releaseFlow();
+    await dispatch;
+
+    const command = store.getExecutionCommand(accepted.executionCommand!.id);
+    store.updateExecutionCommand({ ...command, status: "pending", providerResponse: undefined, completedAt: undefined, updatedAt: clock.now() });
+    const admission = new ExecutionAdmissionService(store, clock, ids);
+    const acquired = admission.admit(
+      command.id,
+      "worker-stale-a",
+      store.getExecutionProfile(project.executionProfileId).executionPolicy,
+      1
+    );
+    expect(acquired.outcome).toBe("acquired");
+    if (acquired.outcome !== "acquired") throw new Error("expected lease");
+    const staleFence = executionFence(acquired.lease);
+    const replacement = admission.takeoverForReconciliation(command.id, "worker-stale-b", 60_000);
+    expect(replacement).toBeDefined();
+    expect(() => admission.renew(staleFence, 60_000)).toThrow(ConflictError);
+  });
+
+  it("keeps capacity reserved through cancellation request until Flow proves quiescence", async () => {
+    const { core, flow, store, project, task, clock, ids } = setup({ executionMode: "asynchronous" });
+    flow.result = { externalRunId: "zf-running", status: "running", exitCode: 0, metadata: {} };
+    flow.cancelResult = { externalRunId: "zf-running", status: "cancelled", quiescent: true, metadata: { reaped: true } };
+    let releaseFlow!: () => void;
+    flow.startBarrier = new Promise<void>((resolve) => { releaseFlow = resolve; });
+    const accepted = await core.startTask(task.id, { ...startInput(), idempotencyKey: "cancel-race" });
+    const runtime = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+      ownerId: "worker-cancel-race",
+      leaseDurationMs: 60_000,
+      policyFor: () => store.getExecutionProfile(project.executionProfileId).executionPolicy
+    });
+    const dispatch = runtime.runOnce();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(store.getExecutionCommand(accepted.executionCommand!.id).status).toBe("dispatching");
+
+    await core.cancelTask(task.id, "user requested cancellation");
+    expect(store.getExecutionCommand(accepted.executionCommand!.id).status).toBe("cancel_requested");
+    expect(core.getTask(task.id).status).toBe("blocked");
+    expect(store.getExecutionLease(accepted.executionCommand!.id)?.status).toBe("active");
+    expect(flow.cancellations).toHaveLength(0);
+
+    releaseFlow();
+    expect(await dispatch).toBe(1);
+    expect(flow.cancellations).toHaveLength(1);
+    expect(store.getExecutionCommand(accepted.executionCommand!.id)).toMatchObject({
+      status: "cancelled",
+      cancelRequestedAt: expect.any(String),
+      cancelAcknowledgedAt: expect.any(String)
+    });
+    expect(core.getTask(task.id).status).toBe("cancelled");
+    expect(store.getExecutionLease(accepted.executionCommand!.id)?.status).toBe("released");
+  });
+
+  it("fails closed after an ambiguous Workspace provider failure instead of replaying Flow", async () => {
     class FlakyWorkspace extends FakeWorkspace {
       attempts = 0;
       async prepare(request: WorkspacePreparationRequest): Promise<PreparedWorkspace> {
@@ -283,10 +542,13 @@ describe("CoreService", () => {
 
     expect(await runtime.runOnce()).toBe(0);
     expect(await runtime.runOnce()).toBe(0);
-    expect(await runtime.runOnce()).toBe(1);
-    expect(workspace.attempts).toBe(3);
-    expect(flow.starts).toBe(1);
-    expect(store.getExecutionCommand(accepted.executionCommand!.id)).toMatchObject({ status: "completed", attempt: 3 });
+    expect(await runtime.runOnce()).toBe(0);
+    expect(workspace.attempts).toBe(1);
+    expect(flow.starts).toBe(0);
+    expect(store.getExecutionCommand(accepted.executionCommand!.id)).toMatchObject({
+      status: "reconciling",
+      lastError: expect.stringContaining("inspection capability")
+    });
   });
 
   it("atomically limits admission across 20 queued commands", async () => {
@@ -334,7 +596,7 @@ describe("CoreService", () => {
     expect(acquired.outcome).toBe("acquired");
     if (acquired.outcome !== "acquired") throw new Error("expected lease");
 
-    expect(() => admission.release(command.id, "worker-b", acquired.lease.fencingToken)).toThrow(ConflictError);
+    expect(() => admission.release({ ...executionFence(acquired.lease), ownerId: "worker-b" })).toThrow(ConflictError);
     const expired = admission.admit(command.id, "worker-b", policy, 60_000);
     expect(expired).toMatchObject({ outcome: "reconcile", lease: { status: "reconciling", fencingToken: 1 } });
     expect(store.getExecutionCommand(command.id).status).toBe("reconciling");
