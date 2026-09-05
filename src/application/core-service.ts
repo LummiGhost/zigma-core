@@ -97,6 +97,7 @@ export interface TaskView {
 export type DispatchExecutionPhase =
   | "lease-acquired"
   | "outbox-claimed"
+  | "before-dispatch-marker"
   | "provider-dispatch-started"
   | "provider-response-received"
   | "provider-result-persisted"
@@ -593,11 +594,9 @@ export class CoreService {
         const latest = this.store.getExecutionCommand(command.id);
         this.store.updateExecutionCommand({ ...latest, attempt: latest.attempt + 1, updatedAt: admittedAt });
       });
-      command = this.store.getExecutionCommand(command.id);
-      if (command.status === "cancel_requested" && !command.dispatchStartedAt) {
-        this.completeCancellationBeforeFlow(command.id, options.fence, payload.callerContext.actor);
-        return this.getTaskView(task.id);
-      }
+      // This seam lets the regression test interleave a cancellation precisely
+      // between admission and the durable provider-dispatch boundary.
+      await options.onPhase?.("before-dispatch-marker");
 
       // Persist this boundary before *any* provider-owned mutation, including
       // Workspace preparation. Workspace's current CLI contract has stable
@@ -605,8 +604,19 @@ export class CoreService {
       // after this point must reconcile rather than replay a possible side
       // effect.
       const dispatchStartedAt = this.clock.now();
+      const dispatchState: {
+        decision: "dispatch" | "terminal" | "cancel-before-dispatch" | "cancel-after-dispatch";
+      } = { decision: "dispatch" };
       this.store.fencedTransaction(options.fence, dispatchStartedAt, () => {
         const latest = this.store.getExecutionCommand(command.id);
+        if (["completed", "failed", "cancelled"].includes(latest.status)) {
+          dispatchState.decision = "terminal";
+          return;
+        }
+        if (latest.status === "cancel_requested") {
+          dispatchState.decision = latest.dispatchStartedAt ? "cancel-after-dispatch" : "cancel-before-dispatch";
+          return;
+        }
         this.store.updateExecutionCommand({
           ...latest,
           status: "dispatching",
@@ -614,6 +624,19 @@ export class CoreService {
           updatedAt: dispatchStartedAt
         });
       });
+      if (dispatchState.decision === "terminal") return this.getTaskView(task.id);
+      if (dispatchState.decision === "cancel-before-dispatch") {
+        this.completeCancellationBeforeFlow(command.id, options.fence, payload.callerContext.actor);
+        return this.getTaskView(task.id);
+      }
+      if (dispatchState.decision === "cancel-after-dispatch") {
+        this.markReconciliationRequired(
+          command.id,
+          options.fence,
+          "Cancellation arrived after provider dispatch began but before Flow run identity was durable"
+        );
+        return this.getTaskView(task.id);
+      }
       await options.onPhase?.("provider-dispatch-started");
       if (this.store.getExecutionCommand(command.id).status === "cancel_requested") {
         this.markReconciliationRequired(

@@ -301,6 +301,28 @@ describe("CoreService", () => {
     expect(core.getTask(task.id).status).toBe("cancelled");
   });
 
+  it("does not invoke Flow when cancellation wins between admission and the dispatch marker", async () => {
+    const { core, flow, store, project, task, clock, ids } = setup({ executionMode: "asynchronous" });
+    const accepted = await core.startTask(task.id, { ...startInput(), idempotencyKey: "cancel-before-marker" });
+    const runtime = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+      ownerId: "worker-cancel-before-marker",
+      policyFor: () => store.getExecutionProfile(project.executionProfileId).executionPolicy,
+      onPhase: async (phase) => {
+        if (phase === "before-dispatch-marker") {
+          await core.cancelTask(task.id, "cancelled in admission-to-dispatch window");
+        }
+      }
+    });
+
+    await runtime.runOnce();
+
+    expect(flow.starts).toBe(0);
+    expect(store.getExecutionCommand(accepted.executionCommand!.id).status).toBe("cancelled");
+    expect(core.getTask(task.id).status).toBe("cancelled");
+    expect(store.getOutboxDeliveryForCommand(accepted.executionCommand!.id)?.status).toBe("cancelled");
+    expect(store.getExecutionLease(accepted.executionCommand!.id)?.status).toBe("released");
+  });
+
   it("does not ACK a claimed delivery until the provider response is durable", async () => {
     const clock = new ManualClock();
     const { core, flow, store, project, task, ids } = setup({ executionMode: "asynchronous", clock });
