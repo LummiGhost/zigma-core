@@ -49,10 +49,16 @@ async function main(): Promise<void> {
     .description("Start the Core HTTP API")
     .option("--host <host>", "Bind host", "127.0.0.1")
     .option("--port <port>", "Bind port", "4736")
-    .action(async (options: { host: string; port: string }) => {
+    .option("--workers <count>", "Concurrent durable dispatch workers", "4")
+    .action(async (options: { host: string; port: string; workers: string }) => {
+      const workerConcurrency = Number(options.workers);
+      if (!Number.isSafeInteger(workerConcurrency) || workerConcurrency < 1) {
+        throw new Error("--workers must be a positive integer");
+      }
       const { core, store, clock, ids } = await openCore(program.opts<{ db: string }>().db, "asynchronous");
       const runtime = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
         ownerId: `core-${process.pid}`,
+        workerConcurrency,
         policyFor(commandId) {
           const command = store.getExecutionCommand(commandId);
           const project = store.getProject(command.projectId);

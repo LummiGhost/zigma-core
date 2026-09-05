@@ -323,6 +323,127 @@ describe("CoreService", () => {
     expect(store.getExecutionLease(accepted.executionCommand!.id)?.status).toBe("released");
   });
 
+  it("dispatches independent durable commands concurrently without exceeding persisted capacity", async () => {
+    const clock = new ManualClock();
+    const { core, flow, store, project, task, ids } = setup({
+      executionMode: "asynchronous",
+      clock,
+      workspacePolicy: {
+        provider: "none",
+        mode: "read-only",
+        branchTemplate: "zigma/{taskId}",
+        cleanup: "manual",
+        snapshotOnTerminal: true
+      }
+    });
+    const second = core.createTask({
+      projectId: project.id, title: "Second", description: "Second independent task", priority: "high",
+      source: { kind: "api", metadata: {} }, createdBy: { type: "user", id: "owner" }, labels: [], metadata: {}
+    });
+    const third = core.createTask({
+      projectId: project.id, title: "Third", description: "Third independent task", priority: "high",
+      source: { kind: "api", metadata: {} }, createdBy: { type: "user", id: "owner" }, labels: [], metadata: {}
+    });
+    await Promise.all([core.startTask(task.id, startInput()), core.startTask(second.id, startInput()), core.startTask(third.id, startInput())]);
+
+    let releaseFlow!: () => void;
+    flow.startBarrier = new Promise<void>((resolve) => { releaseFlow = resolve; });
+    const runtime = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+      ownerId: "worker-parallel-capacity",
+      workerConcurrency: 3,
+      policyFor: (commandId) => store.getExecutionProfile(store.getProject(store.getExecutionCommand(commandId).projectId).executionProfileId).executionPolicy
+    });
+
+    const firstSweep = runtime.runOnce();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // The default persisted policy allows two read-only commands per repository;
+    // the third worker loses the atomic admission race rather than oversubscribing.
+    expect(flow.starts).toBe(2);
+    expect(store.listExecutionLeases().filter((lease) => lease.status === "active")).toHaveLength(2);
+
+    releaseFlow();
+    const firstDispatched = await firstSweep;
+    expect(firstDispatched).toBe(2);
+    expect(await runtime.runOnce()).toBe(1);
+    expect(flow.starts).toBe(3);
+  });
+
+  it("bounds one runtime sweep to its configured worker count", async () => {
+    const clock = new ManualClock();
+    const { core, flow, store, project, task, ids } = setup({
+      executionMode: "asynchronous",
+      clock,
+      workspacePolicy: {
+        provider: "none",
+        mode: "read-only",
+        branchTemplate: "zigma/{taskId}",
+        cleanup: "manual",
+        snapshotOnTerminal: true
+      }
+    });
+    const second = core.createTask({
+      projectId: project.id, title: "Second", description: "Second independent task", priority: "high",
+      source: { kind: "api", metadata: {} }, createdBy: { type: "user", id: "owner" }, labels: [], metadata: {}
+    });
+    await Promise.all([core.startTask(task.id, startInput()), core.startTask(second.id, startInput())]);
+
+    let releaseFlow!: () => void;
+    flow.startBarrier = new Promise<void>((resolve) => { releaseFlow = resolve; });
+    const runtime = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+      ownerId: "worker-single-slot",
+      workerConcurrency: 1,
+      policyFor: (commandId) => store.getExecutionProfile(store.getProject(store.getExecutionCommand(commandId).projectId).executionProfileId).executionPolicy
+    });
+
+    const sweep = runtime.runOnce();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(flow.starts).toBe(1);
+    releaseFlow();
+    expect(await sweep).toBe(2);
+    expect(flow.starts).toBe(2);
+  });
+
+  it("stops polling but waits for active parallel workers to settle", async () => {
+    const clock = new ManualClock();
+    const { core, flow, store, project, task, ids } = setup({
+      executionMode: "asynchronous",
+      clock,
+      workspacePolicy: {
+        provider: "none",
+        mode: "read-only",
+        branchTemplate: "zigma/{taskId}",
+        cleanup: "manual",
+        snapshotOnTerminal: true
+      }
+    });
+    const second = core.createTask({
+      projectId: project.id, title: "Second", description: "Second independent task", priority: "high",
+      source: { kind: "api", metadata: {} }, createdBy: { type: "user", id: "owner" }, labels: [], metadata: {}
+    });
+    await Promise.all([core.startTask(task.id, startInput()), core.startTask(second.id, startInput())]);
+
+    let releaseFlow!: () => void;
+    flow.startBarrier = new Promise<void>((resolve) => { releaseFlow = resolve; });
+    const runtime = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+      ownerId: "worker-stop-parallel",
+      workerConcurrency: 2,
+      pollIntervalMs: 1,
+      policyFor: (commandId) => store.getExecutionProfile(store.getProject(store.getExecutionCommand(commandId).projectId).executionProfileId).executionPolicy
+    });
+    runtime.start();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(flow.starts).toBe(2);
+
+    let stopped = false;
+    const stopping = runtime.stop().then(() => { stopped = true; });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(stopped).toBe(false);
+    releaseFlow();
+    await stopping;
+    expect(stopped).toBe(true);
+    expect(flow.starts).toBe(2);
+  });
+
   it("does not ACK a claimed delivery until the provider response is durable", async () => {
     const clock = new ManualClock();
     const { core, flow, store, project, task, ids } = setup({ executionMode: "asynchronous", clock });
