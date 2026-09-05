@@ -20,7 +20,13 @@ import {
   RecordFlowEventInputSchema,
   StartTaskInputSchema
 } from "../contracts/schemas.js";
-import type { Clock, FlowExecutor, IdGenerator, WorkspaceProvider } from "../contracts/ports.js";
+import type {
+  Clock,
+  ExecutionLeaseFence,
+  FlowExecutor,
+  IdGenerator,
+  WorkspaceProvider
+} from "../contracts/ports.js";
 import type {
   AuditEvent,
   EvidenceBundle,
@@ -87,6 +93,36 @@ export interface TaskView {
     items: EvidenceItem[];
   };
 }
+
+export type DispatchExecutionPhase =
+  | "lease-acquired"
+  | "outbox-claimed"
+  | "before-dispatch-marker"
+  | "provider-dispatch-started"
+  | "provider-response-received"
+  | "provider-result-persisted"
+  | "outbox-acknowledged";
+
+/** Test-only process-loss signal that intentionally bypasses failure projection. */
+export class DispatchCrashpointError extends Error {
+  constructor(readonly phase: DispatchExecutionPhase) {
+    super(`Simulated process crash after ${phase}`);
+    this.name = "DispatchCrashpointError";
+  }
+}
+
+export interface DispatchExecutionOptions {
+  fence: ExecutionLeaseFence;
+  onPhase?(phase: DispatchExecutionPhase): void | Promise<void>;
+}
+
+type FlowResultProjection = {
+  externalRunId: string;
+  status: FlowRun["status"];
+  exitCode?: number;
+  summary?: string;
+  metadata: Record<string, unknown>;
+};
 
 export class CoreService {
   private readonly store: SqliteStore;
@@ -518,9 +554,17 @@ export class CoreService {
     }
   }
 
-  async dispatchExecutionCommand(commandId: string): Promise<TaskView> {
+  async dispatchExecutionCommand(commandId: string, options: DispatchExecutionOptions): Promise<TaskView> {
     let command = this.store.getExecutionCommand(commandId);
-    if (["completed", "cancelled"].includes(command.status)) return this.getTaskView(command.taskId);
+    if (["completed", "failed", "cancelled"].includes(command.status)) return this.getTaskView(command.taskId);
+    if (options.fence.commandId !== commandId) {
+      throw new ConflictError("Execution fence does not belong to the dispatched command", {
+        commandId,
+        fenceCommandId: options.fence.commandId
+      });
+    }
+    this.store.assertExecutionFence(options.fence, this.clock.now());
+
     const task = this.store.getTask(command.taskId);
     const project = this.store.getProject(command.projectId);
     const profile = this.store.getExecutionProfile(project.executionProfileId);
@@ -530,8 +574,10 @@ export class CoreService {
     const payload = command.payload as {
       workflowRef: string; branch: string; inputs: Record<string, string>;
       parallelism?: number; dryRun: boolean; callerContext: StartTaskInput["callerContext"];
+      cancellationReason?: string;
     };
     let workspace: WorkspaceRef | undefined;
+
     try {
       this.assertSupportedWorkspacePolicy(command.workspacePolicy);
       await this.preflightProviders(profile, command.workspacePolicy.provider !== "none");
@@ -539,14 +585,76 @@ export class CoreService {
       if (!repository) throw new ConflictError("Repository is not bound to the project", { repositoryId: command.repositoryId });
       this.assertBranchAllowed(payload.callerContext.constraints.branchPatterns, payload.branch);
       this.assertWorkspaceModeAllowed(repository, command.workspacePolicy.mode);
-      let currentTask = task;
-      if (currentTask.status === "blocked") currentTask = this.transitionTask(currentTask, "queued", payload.callerContext.actor);
-      if (currentTask.status === "queued") this.transitionTask(currentTask, "provisioning", payload.callerContext.actor);
-      command = { ...command, attempt: command.attempt + 1, updatedAt: this.clock.now() };
-      this.store.updateExecutionCommand(command);
-      if (command.workspacePolicy.provider !== "none") {
+
+      const admittedAt = this.clock.now();
+      this.store.fencedTransaction(options.fence, admittedAt, () => {
+        let currentTask = this.store.getTask(task.id);
+        if (currentTask.status === "blocked") currentTask = this.transitionTask(currentTask, "queued", payload.callerContext.actor);
+        if (currentTask.status === "queued") this.transitionTask(currentTask, "provisioning", payload.callerContext.actor);
+        const latest = this.store.getExecutionCommand(command.id);
+        this.store.updateExecutionCommand({ ...latest, attempt: latest.attempt + 1, updatedAt: admittedAt });
+      });
+      // This seam lets the regression test interleave a cancellation precisely
+      // between admission and the durable provider-dispatch boundary.
+      await options.onPhase?.("before-dispatch-marker");
+
+      // Persist this boundary before *any* provider-owned mutation, including
+      // Workspace preparation. Workspace's current CLI contract has stable
+      // operation identities but not a fenced read-back API, so a process loss
+      // after this point must reconcile rather than replay a possible side
+      // effect.
+      const dispatchStartedAt = this.clock.now();
+      const dispatchState: {
+        decision: "dispatch" | "terminal" | "cancel-before-dispatch" | "cancel-after-dispatch";
+      } = { decision: "dispatch" };
+      this.store.fencedTransaction(options.fence, dispatchStartedAt, () => {
+        const latest = this.store.getExecutionCommand(command.id);
+        if (["completed", "failed", "cancelled"].includes(latest.status)) {
+          dispatchState.decision = "terminal";
+          return;
+        }
+        if (latest.status === "cancel_requested") {
+          dispatchState.decision = latest.dispatchStartedAt ? "cancel-after-dispatch" : "cancel-before-dispatch";
+          return;
+        }
+        this.store.updateExecutionCommand({
+          ...latest,
+          status: "dispatching",
+          dispatchStartedAt,
+          updatedAt: dispatchStartedAt
+        });
+      });
+      if (dispatchState.decision === "terminal") return this.getTaskView(task.id);
+      if (dispatchState.decision === "cancel-before-dispatch") {
+        this.completeCancellationBeforeFlow(command.id, options.fence, payload.callerContext.actor);
+        return this.getTaskView(task.id);
+      }
+      if (dispatchState.decision === "cancel-after-dispatch") {
+        this.markReconciliationRequired(
+          command.id,
+          options.fence,
+          "Cancellation arrived after provider dispatch began but before Flow run identity was durable"
+        );
+        return this.getTaskView(task.id);
+      }
+      await options.onPhase?.("provider-dispatch-started");
+      if (this.store.getExecutionCommand(command.id).status === "cancel_requested") {
+        this.markReconciliationRequired(
+          command.id,
+          options.fence,
+          "Cancellation arrived after provider dispatch began but before Flow run identity was durable"
+        );
+        return this.getTaskView(task.id);
+      }
+
+      const currentRun = this.store.getFlowRun(run.id);
+      if (currentRun.workspaceId) workspace = this.store.getWorkspace(currentRun.workspaceId);
+      if (!workspace && command.workspacePolicy.provider !== "none") {
         if (!this.workspaceProvider) throw new IntegrationError("Project requires a workspace provider, but none is configured");
+        this.assertMutatingProviderFence(options.fence);
         const prepared = await this.workspaceProvider.prepare({
+          operationId: `${command.operationId}:workspace:create`,
+          executionFence: options.fence,
           projectId: project.id, taskId: task.id, flowRunId: run.id, repository,
           baseRef: command.baseRef, branch: payload.branch, policy: command.workspacePolicy,
           command: profile.workspaceCommand, timeoutMs: profile.timeoutMs, environment: profile.environment
@@ -560,29 +668,60 @@ export class CoreService {
           branch: prepared.branch, mode: prepared.mode, status: "active", metadata: prepared.metadata,
           createdAt: workspaceNow, updatedAt: workspaceNow
         };
-        this.store.transaction(() => {
+        this.store.fencedTransaction(options.fence, workspaceNow, () => {
           this.store.insertWorkspace(workspace!);
           this.store.updateFlowRun({ ...this.store.getFlowRun(run.id), workspaceId: workspace!.id, updatedAt: workspaceNow });
         });
+
+        if (this.store.getExecutionCommand(command.id).status === "cancel_requested") {
+          this.markReconciliationRequired(
+            command.id,
+            options.fence,
+            "Cancellation arrived after Workspace preparation; Flow run identity requires reconciliation"
+          );
+          return this.getTaskView(task.id);
+        }
+        this.assertMutatingProviderFence(options.fence);
         await this.workspaceProvider.bindRun?.(prepared.externalId, task.id, run.id, {
-          command: profile.workspaceCommand, timeoutMs: profile.timeoutMs, environment: profile.environment
+          command: profile.workspaceCommand,
+          timeoutMs: profile.timeoutMs,
+          environment: profile.environment,
+          operationId: `${command.operationId}:workspace:bind`,
+          executionFence: options.fence
         });
       }
-      const startedAt = this.clock.now();
-      const currentRun = this.store.getFlowRun(run.id);
-      if (currentRun.status === "created") {
-        this.store.updateFlowRun({ ...currentRun, status: "starting", startedAt, updatedAt: startedAt });
+
+      if (this.store.getExecutionCommand(command.id).status === "cancel_requested") {
+        this.markReconciliationRequired(
+          command.id,
+          options.fence,
+          "Cancellation arrived after provider dispatch began but before Flow invocation"
+        );
+        return this.getTaskView(task.id);
       }
-      const taskBeforeInvoke = this.store.getTask(task.id);
-      if (taskBeforeInvoke.status === "provisioning") this.transitionTask(taskBeforeInvoke, "running", payload.callerContext.actor);
-      this.store.updateExecutionCommand({ ...command, status: "dispatched", updatedAt: startedAt });
+
+      const startedAt = this.clock.now();
+      this.store.fencedTransaction(options.fence, startedAt, () => {
+        const runBeforeStart = this.store.getFlowRun(run.id);
+        if (runBeforeStart.status === "created") {
+          assertFlowTransition(runBeforeStart.status, "starting");
+          this.store.updateFlowRun({ ...runBeforeStart, status: "starting", startedAt, updatedAt: startedAt });
+        }
+        const taskBeforeInvoke = this.store.getTask(task.id);
+        if (taskBeforeInvoke.status === "provisioning") this.transitionTask(taskBeforeInvoke, "running", payload.callerContext.actor);
+        // dispatchStartedAt was committed before any Workspace/Flow provider
+        // mutation above. Do not move this marker behind a side effect.
+      });
+      this.assertMutatingProviderFence(options.fence);
+
       const result = await this.flowExecutor.start({
-        operationId: command.operationId, callbackCorrelationId: command.callbackCorrelationId,
+        operationId: command.operationId,
+        executionFence: options.fence,
+        callbackCorrelationId: command.callbackCorrelationId,
         command: profile.flowCommand, projectId: project.id, taskId: task.id, flowRunId: run.id,
         workflowRef: payload.workflowRef, taskText: task.description,
         projectRoot: workspace?.path ?? String(project.metadata["projectRoot"] ?? process.cwd()),
-        repository: project.repositories.find((candidate) => candidate.id === command.repositoryId),
-        baseRef: command.baseRef, workspacePolicy: command.workspacePolicy,
+        repository, baseRef: command.baseRef, workspacePolicy: command.workspacePolicy,
         inputs: { ...payload.inputs, zigma_core_task_id: task.id, zigma_core_flow_run_id: run.id,
           zigma_core_permission_snapshot_id: permissionSnapshot.id,
           zigma_core_permission_snapshot_hash: permissionSnapshot.hash,
@@ -595,36 +734,397 @@ export class CoreService {
         timeoutMs: payload.callerContext.constraints.maxRunDurationMs ?? profile.timeoutMs,
         environment: profile.environment, dryRun: payload.dryRun
       });
-      this.applyFlowResult(run.id, result, payload.callerContext.actor);
-      const completedAt = this.clock.now();
-      this.store.updateExecutionCommand({ ...this.store.getExecutionCommand(command.id), status: "completed", updatedAt: completedAt, completedAt });
-      try { await this.collectWorkspaceEvidence(run.id, profile); }
+      await options.onPhase?.("provider-response-received");
+
+      const responseAt = this.clock.now();
+      this.store.fencedTransaction(options.fence, responseAt, () => {
+        this.applyFlowResultState(run.id, result, payload.callerContext.actor);
+        const latest = this.store.getExecutionCommand(command.id);
+        const cancellationStillPending = latest.status === "cancel_requested"
+          && !["completed", "failed", "cancelled"].includes(result.status);
+        this.store.updateExecutionCommand({
+          ...latest,
+          status: cancellationStillPending
+            ? "cancel_requested"
+            : result.status === "cancelled"
+              ? "cancelled"
+              : result.status === "failed"
+                ? "failed"
+                : result.status === "completed"
+                  ? "completed"
+                  : "dispatched",
+          providerResponse: this.flowResultRecord(result),
+          updatedAt: responseAt,
+          ...(!cancellationStillPending && ["completed", "failed", "cancelled"].includes(result.status)
+            ? { completedAt: responseAt }
+            : {})
+        });
+      });
+      await options.onPhase?.("provider-result-persisted");
+
+      const afterResult = this.store.getExecutionCommand(command.id);
+      if (afterResult.status === "cancel_requested") {
+        await this.propagateCancellation(
+          afterResult,
+          options.fence,
+          payload.cancellationReason ?? "Cancellation requested while provider dispatch was active",
+          payload.callerContext.actor
+        );
+      }
+
+      try { await this.collectWorkspaceEvidence(run.id, profile, options.fence); }
       catch (error) { this.markEvidenceCollectionIncomplete(run.id, task.id, error instanceof Error ? error.message : String(error)); }
       return this.getTaskView(task.id);
     } catch (error) {
+      if (error instanceof DispatchCrashpointError) throw error;
       const message = error instanceof Error ? error.message : String(error);
       const failedAt = this.clock.now();
-      const latestCommand = this.store.getExecutionCommand(command.id);
-      const currentRun = this.store.getFlowRun(run.id);
-      const currentTask = this.store.getTask(task.id);
-      if (latestCommand.status === "leased" && latestCommand.attempt < 3) {
-        if (currentTask.status === "provisioning") this.transitionTask(currentTask, "blocked", SYSTEM_ACTOR, undefined, { retryable: true, attempt: latestCommand.attempt });
-        this.store.updateExecutionCommand({ ...latestCommand, status: "pending", lastError: message, updatedAt: failedAt });
+      try {
+        this.store.fencedTransaction(options.fence, failedAt, () => {
+          const latestCommand = this.store.getExecutionCommand(command.id);
+          const currentRun = this.store.getFlowRun(run.id);
+          const currentTask = this.store.getTask(task.id);
+          if (latestCommand.status === "cancel_requested") {
+            this.store.updateExecutionCommand({ ...latestCommand, lastError: message, updatedAt: failedAt });
+            return;
+          }
+          if (latestCommand.status === "leased" && latestCommand.attempt < 3) {
+            if (currentTask.status === "provisioning") this.transitionTask(currentTask, "blocked", SYSTEM_ACTOR, undefined, { retryable: true, attempt: latestCommand.attempt });
+            this.store.updateExecutionCommand({ ...latestCommand, status: "pending", lastError: message, updatedAt: failedAt });
+            return;
+          }
+          if (["dispatching", "dispatched", "reconciling"].includes(latestCommand.status)) {
+            if (["running", "provisioning"].includes(currentTask.status)) this.transitionTask(currentTask, "blocked", SYSTEM_ACTOR, undefined, { reconciliationRequired: true });
+            this.store.updateExecutionCommand({ ...latestCommand, status: "reconciling", lastError: message, updatedAt: failedAt });
+            return;
+          }
+          if (!["completed", "failed", "cancelled"].includes(currentRun.status)) {
+            this.store.updateFlowRun({ ...currentRun, status: "failed", error: { code: "DISPATCH_FAILED", message, details: {} }, updatedAt: failedAt, completedAt: failedAt });
+            const refreshedTask = this.store.getTask(task.id);
+            if (!["completed", "failed", "cancelled"].includes(refreshedTask.status)) this.transitionTask(refreshedTask, "failed", SYSTEM_ACTOR, { code: "DISPATCH_FAILED", message, details: {} });
+          }
+          this.store.updateExecutionCommand({ ...latestCommand, status: "failed", lastError: message, updatedAt: failedAt, completedAt: failedAt });
+        });
+      } catch (commitError) {
+        if (commitError instanceof ConflictError) throw commitError;
         throw error;
       }
-      if (latestCommand.status === "dispatched") {
-        if (currentTask.status === "running") this.transitionTask(currentTask, "blocked", SYSTEM_ACTOR, undefined, { reconciliationRequired: true });
-        this.store.updateExecutionCommand({ ...latestCommand, status: "reconciling", lastError: message, updatedAt: failedAt });
-        throw error;
-      }
-      if (!["completed", "failed", "cancelled"].includes(currentRun.status)) {
-        this.store.updateFlowRun({ ...currentRun, status: "failed", error: { code: "DISPATCH_FAILED", message, details: {} }, updatedAt: failedAt, completedAt: failedAt });
-        const refreshedTask = this.store.getTask(task.id);
-        if (!["completed", "failed", "cancelled"].includes(refreshedTask.status)) this.transitionTask(refreshedTask, "failed", SYSTEM_ACTOR, { code: "DISPATCH_FAILED", message, details: {} });
-      }
-      this.store.updateExecutionCommand({ ...latestCommand, status: "failed", lastError: message, updatedAt: failedAt, completedAt: failedAt });
       throw error;
     }
+  }
+
+  /**
+   * Reconstructs an interrupted delivery from provider-owned truth.  A provider
+   * that cannot inspect an operation is deliberately not treated as a negative
+   * result: the command remains reconciliation-required and retains capacity.
+   */
+  async reconcileExecutionCommand(commandId: string, fence: ExecutionLeaseFence): Promise<void> {
+    if (fence.commandId !== commandId) {
+      throw new ConflictError("Execution fence does not belong to the reconciled command", {
+        commandId,
+        fenceCommandId: fence.commandId
+      });
+    }
+    const command = this.store.getExecutionCommand(commandId);
+    if (["completed", "failed", "cancelled"].includes(command.status)) return;
+    this.store.assertExecutionFence(fence, this.clock.now());
+
+    // The dispatch-start marker is committed before the first provider call.
+    // Its absence is durable proof that retrying is safe, even if an outbox
+    // claim was interrupted before the call was made.
+    if (!command.dispatchStartedAt) {
+      this.store.resetExecutionForRedispatch(
+        command.id,
+        fence,
+        this.clock.now(),
+        "Recovered an interrupted claim before provider dispatch began"
+      );
+      return;
+    }
+
+    const run = this.store.getFlowRun(command.flowRunId);
+    const profile = this.store.getExecutionProfile(run.executionProfileId);
+    const workspace = run.workspaceId ? this.store.getWorkspace(run.workspaceId) : undefined;
+    if (!this.flowExecutor.reconcile) {
+      this.markReconciliationRequired(
+        command.id,
+        fence,
+        "Flow provider does not advertise an operation inspection capability"
+      );
+      return;
+    }
+
+    this.assertMutatingProviderFence(fence);
+    const result = await this.flowExecutor.reconcile({
+      operationId: command.operationId,
+      executionFence: fence,
+      ...(run.externalRunId ? { externalRunId: run.externalRunId } : {}),
+      command: profile.flowCommand,
+      projectRoot: workspace?.path ?? process.cwd(),
+      timeoutMs: profile.timeoutMs,
+      environment: profile.environment
+    });
+
+    if (result.outcome === "not_found") {
+      if (result.safeToRedispatch) {
+        this.store.resetExecutionForRedispatch(
+          command.id,
+          fence,
+          this.clock.now(),
+          "Provider fenced the missing operation and explicitly permits redispatch"
+        );
+      } else {
+        this.markReconciliationRequired(command.id, fence, "Provider could not prove that redispatch is safe");
+      }
+      return;
+    }
+    if (result.outcome === "unsupported" || result.outcome === "unknown") {
+      this.markReconciliationRequired(command.id, fence, result.reason);
+      return;
+    }
+    if (result.outcome !== "found") {
+      this.markReconciliationRequired(command.id, fence, "Provider returned an unrecognized reconciliation outcome");
+      return;
+    }
+
+    if (["completed", "failed", "cancelled"].includes(result.status) && !result.quiescent) {
+      this.markReconciliationRequired(
+        command.id,
+        fence,
+        "Provider reported a terminal result without quiescent proof"
+      );
+      return;
+    }
+
+    const reconciledAt = this.clock.now();
+    this.store.fencedTransaction(fence, reconciledAt, () => {
+      const currentCommand = this.store.getExecutionCommand(command.id);
+      const currentRun = this.store.getFlowRun(command.flowRunId);
+      const reconciledResult = {
+        externalRunId: result.externalRunId,
+        status: result.status,
+        ...(result.exitCode !== undefined ? { exitCode: result.exitCode } : {}),
+        ...(result.summary !== undefined ? { summary: result.summary } : {}),
+        metadata: { ...result.metadata, reconciled: true }
+      };
+      this.applyFlowResultState(currentRun.id, reconciledResult, SYSTEM_ACTOR);
+      const terminal = ["completed", "failed", "cancelled"].includes(result.status);
+      this.store.updateExecutionCommand({
+        ...currentCommand,
+        status: terminal
+          ? result.status === "cancelled"
+            ? "cancelled"
+            : result.status === "failed"
+              ? "failed"
+              : "completed"
+          : currentCommand.status === "cancel_requested"
+            ? "cancel_requested"
+            : "reconciling",
+        providerResponse: this.flowResultRecord(reconciledResult),
+        ...(currentCommand.status === "cancel_requested" && result.status === "cancelled"
+          ? { cancelAcknowledgedAt: reconciledAt }
+          : {}),
+        updatedAt: reconciledAt,
+        ...(terminal ? { completedAt: reconciledAt } : {})
+      });
+    });
+
+    const refreshed = this.store.getExecutionCommand(command.id);
+    if (refreshed.status === "cancel_requested") {
+      await this.propagateCancellation(
+        refreshed,
+        fence,
+        String((refreshed.payload as Record<string, unknown>)["cancellationReason"] ?? "Cancellation requested during reconciliation"),
+        SYSTEM_ACTOR
+      );
+    }
+  }
+
+  private requestAsynchronousCancellation(
+    commandId: string,
+    reason: string,
+    actor: AuditEvent["actor"]
+  ): void {
+    const now = this.clock.now();
+    this.store.transaction(() => {
+      const command = this.store.getExecutionCommand(commandId);
+      if (["completed", "failed", "cancelled"].includes(command.status)) return;
+      if (!command.dispatchStartedAt) {
+        this.completeCancellationBeforeFlowState(command, actor, reason, now);
+        return;
+      }
+
+      const requested: ExecutionCommand = {
+        ...command,
+        status: "cancel_requested",
+        payload: { ...command.payload, cancellationReason: reason },
+        cancelRequestedAt: command.cancelRequestedAt ?? now,
+        updatedAt: now
+      };
+      this.store.updateExecutionCommand(requested);
+      const task = this.store.getTask(command.taskId);
+      if (["provisioning", "running", "awaiting_human"].includes(task.status)) {
+        this.transitionTask(task, "blocked", actor, undefined, { cancellationRequested: true, reason });
+      }
+      this.audit("flow-run", command.flowRunId, "execution-command.cancel-requested", actor, {
+        reason,
+        dispatchStartedAt: command.dispatchStartedAt
+      }, command.taskId);
+    });
+  }
+
+  private completeCancellationBeforeFlow(
+    commandId: string,
+    fence: ExecutionLeaseFence,
+    actor: AuditEvent["actor"],
+    reason = "Cancellation requested before provider dispatch"
+  ): void {
+    const now = this.clock.now();
+    this.store.fencedTransaction(fence, now, () => {
+      this.completeCancellationBeforeFlowState(this.store.getExecutionCommand(commandId), actor, reason, now);
+    });
+  }
+
+  private completeCancellationBeforeFlowState(
+    command: ExecutionCommand,
+    actor: AuditEvent["actor"],
+    reason: string,
+    now: string
+  ): void {
+    if (["completed", "failed", "cancelled"].includes(command.status)) return;
+    if (command.dispatchStartedAt) {
+      throw new ConflictError("Cannot acknowledge cancellation before Flow after dispatch has started", {
+        commandId: command.id,
+        dispatchStartedAt: command.dispatchStartedAt
+      });
+    }
+    const run = this.store.getFlowRun(command.flowRunId);
+    const task = this.store.getTask(command.taskId);
+    this.store.updateExecutionCommand({
+      ...command,
+      status: "cancelled",
+      payload: { ...command.payload, cancellationReason: reason },
+      providerResponse: { cancellation: "not-dispatched", quiescent: true },
+      cancelRequestedAt: command.cancelRequestedAt ?? now,
+      cancelAcknowledgedAt: now,
+      updatedAt: now,
+      completedAt: now
+    });
+    this.store.cancelOutboxDeliveryForCommand(command.id, now);
+    if (!["completed", "failed", "cancelled"].includes(run.status)) {
+      assertFlowTransition(run.status, "cancelled");
+      this.store.updateFlowRun({ ...run, status: "cancelled", updatedAt: now, completedAt: now });
+    }
+    if (!["completed", "failed", "cancelled"].includes(task.status)) {
+      this.transitionTask(task, "cancelled", actor, undefined, { reason, quiescent: true, providerDispatched: false });
+    }
+    this.audit("flow-run", command.flowRunId, "execution-command.cancel-acknowledged", actor, {
+      reason,
+      quiescent: true,
+      providerDispatched: false
+    }, command.taskId);
+  }
+
+  private async propagateCancellation(
+    command: ExecutionCommand,
+    fence: ExecutionLeaseFence,
+    reason: string,
+    actor: AuditEvent["actor"]
+  ): Promise<void> {
+    const run = this.store.getFlowRun(command.flowRunId);
+    if (!run.externalRunId || !this.flowExecutor.cancel) {
+      this.markReconciliationRequired(
+        command.id,
+        fence,
+        !run.externalRunId
+          ? "Cancellation cannot be delivered until provider operation identity is reconciled"
+          : "Flow provider does not advertise cancellation quiescence"
+      );
+      return;
+    }
+    const profile = this.store.getExecutionProfile(run.executionProfileId);
+    const workspace = run.workspaceId ? this.store.getWorkspace(run.workspaceId) : undefined;
+    this.assertMutatingProviderFence(fence);
+    let result: Awaited<ReturnType<NonNullable<FlowExecutor["cancel"]>>>;
+    try {
+      result = await this.flowExecutor.cancel({
+        operationId: command.operationId,
+        executionFence: fence,
+        command: profile.flowCommand,
+        externalRunId: run.externalRunId,
+        projectRoot: workspace?.path ?? process.cwd(),
+        reason,
+        timeoutMs: profile.timeoutMs,
+        environment: profile.environment
+      });
+    } catch (error) {
+      this.markReconciliationRequired(
+        command.id,
+        fence,
+        `Cancellation delivery failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+      return;
+    }
+    if (!result.quiescent) {
+      this.markReconciliationRequired(command.id, fence, "Flow cancellation response lacked quiescent proof");
+      return;
+    }
+
+    const acknowledgedAt = this.clock.now();
+    this.store.fencedTransaction(fence, acknowledgedAt, () => {
+      const current = this.store.getExecutionCommand(command.id);
+      if (["completed", "failed", "cancelled"].includes(current.status)) return;
+      this.applyFlowResultState(command.flowRunId, result, actor);
+      this.store.updateExecutionCommand({
+        ...current,
+        status: result.status === "cancelled" ? "cancelled" : result.status === "failed" ? "failed" : "completed",
+        providerResponse: this.flowResultRecord(result),
+        cancelRequestedAt: current.cancelRequestedAt ?? acknowledgedAt,
+        cancelAcknowledgedAt: acknowledgedAt,
+        updatedAt: acknowledgedAt,
+        completedAt: acknowledgedAt
+      });
+      this.audit("flow-run", command.flowRunId, "execution-command.cancel-acknowledged", actor, {
+        reason,
+        quiescent: true,
+        providerStatus: result.status
+      }, command.taskId);
+    });
+  }
+
+  private markReconciliationRequired(commandId: string, fence: ExecutionLeaseFence, reason: string): void {
+    const now = this.clock.now();
+    this.store.fencedTransaction(fence, now, () => {
+      const command = this.store.getExecutionCommand(commandId);
+      if (["completed", "failed", "cancelled"].includes(command.status)) return;
+      this.store.updateExecutionCommand({
+        ...command,
+        ...(command.status === "cancel_requested" ? {} : { status: "reconciling" }),
+        lastError: reason,
+        updatedAt: now
+      });
+      const task = this.store.getTask(command.taskId);
+      if (["provisioning", "running", "awaiting_human"].includes(task.status)) {
+        this.transitionTask(task, "blocked", SYSTEM_ACTOR, undefined, { reconciliationRequired: true, reason });
+      }
+      this.audit("flow-run", command.flowRunId, "execution-command.reconciliation-required", SYSTEM_ACTOR, {
+        reason
+      }, command.taskId);
+    });
+  }
+
+  private assertMutatingProviderFence(fence: ExecutionLeaseFence): void {
+    this.store.assertExecutionFence(fence, this.clock.now());
+  }
+
+  private flowResultRecord(result: FlowResultProjection): Record<string, unknown> {
+    return {
+      externalRunId: result.externalRunId,
+      status: result.status,
+      ...(result.exitCode !== undefined ? { exitCode: result.exitCode } : {}),
+      ...(result.summary !== undefined ? { summary: result.summary } : {}),
+      metadata: result.metadata
+    };
   }
 
   private async preflightProviders(
@@ -983,16 +1483,51 @@ export class CoreService {
     if (task.activeFlowRunId) {
       const run = this.store.getFlowRun(task.activeFlowRunId);
       const command = this.store.getExecutionCommandForRun(run.id);
+      if (this.executionMode === "asynchronous" && command) {
+        this.requestAsynchronousCancellation(command.id, reason, actor);
+        return this.store.getTask(task.id);
+      }
       if (run.externalRunId && this.flowExecutor.cancel) {
         const workspace = run.workspaceId ? this.store.getWorkspace(run.workspaceId) : undefined;
         const profile = this.store.getExecutionProfile(run.executionProfileId);
-        await this.flowExecutor.cancel({
+        const result = await this.flowExecutor.cancel({
+          ...(command ? { operationId: command.operationId } : {}),
           command: profile.flowCommand,
           externalRunId: run.externalRunId,
           projectRoot: workspace?.path ?? process.cwd(),
           reason,
           timeoutMs: profile.timeoutMs,
           environment: profile.environment
+        });
+        if (!result.quiescent) {
+          throw new IntegrationError("Flow cancellation did not provide quiescent proof", {
+            taskId,
+            flowRunId: run.id,
+            externalRunId: run.externalRunId
+          });
+        }
+        const now = this.clock.now();
+        this.store.transaction(() => {
+          this.applyFlowResultState(run.id, result, actor);
+          if (command && !["completed", "failed", "cancelled"].includes(command.status)) {
+            this.store.updateExecutionCommand({
+              ...this.store.getExecutionCommand(command.id),
+              status: result.status === "cancelled" ? "cancelled" : result.status === "failed" ? "failed" : "completed",
+              providerResponse: this.flowResultRecord(result),
+              cancelRequestedAt: now,
+              cancelAcknowledgedAt: now,
+              updatedAt: now,
+              completedAt: now
+            });
+          }
+        });
+        return this.store.getTask(task.id);
+      }
+      if (run.externalRunId && !this.flowExecutor.cancel) {
+        throw new IntegrationError("Flow executor cannot prove cancellation quiescence", {
+          taskId,
+          flowRunId: run.id,
+          externalRunId: run.externalRunId
         });
       }
       if (!["completed", "failed", "cancelled"].includes(run.status)) {
@@ -1011,9 +1546,22 @@ export class CoreService {
     return this.store.listAuditEvents("task", taskId);
   }
 
-  private applyFlowResult(flowRunId: string, result: Awaited<ReturnType<FlowExecutor["start"]>>, actor: { type: "user" | "agent" | "service" | "system"; id: string; displayName?: string; provider?: string; externalId?: string }): void {
+  private applyFlowResult(
+    flowRunId: string,
+    result: FlowResultProjection,
+    actor: AuditEvent["actor"]
+  ): void {
+    this.store.transaction(() => this.applyFlowResultState(flowRunId, result, actor));
+  }
+
+  /** Caller owns the surrounding transaction (normal or fenced). */
+  private applyFlowResultState(
+    flowRunId: string,
+    result: FlowResultProjection,
+    actor: AuditEvent["actor"]
+  ): void {
     const run = this.store.getFlowRun(flowRunId);
-    assertFlowTransition(run.status, result.status);
+    if (run.status !== result.status) assertFlowTransition(run.status, result.status);
     const now = this.clock.now();
     const terminal = ["completed", "failed", "cancelled"].includes(result.status);
     const updated: FlowRun = {
@@ -1025,26 +1573,24 @@ export class CoreService {
       updatedAt: now,
       ...(terminal ? { completedAt: now } : {})
     };
-    this.store.transaction(() => {
-      this.store.updateFlowRun(updated);
-      this.syncTaskToFlowStatus(run.taskId, result.status, actor);
-      const bundle = this.store.getEvidenceBundleByRun(run.id);
-      this.store.insertEvidenceItem({
-        id: this.ids.next("item"),
-        bundleId: bundle.id,
-        kind: "summary",
-        name: "flow-result",
-        uri: `zigma://flow-runs/${run.id}`,
-        summary: result.summary ?? `Flow run finished with status ${result.status}`,
-        metadata: { externalRunId: result.externalRunId, exitCode: result.exitCode, ...result.metadata },
-        createdAt: now
-      });
-      this.audit("flow-run", run.id, `flow-run.${result.status}`, actor, {
-        externalRunId: result.externalRunId,
-        exitCode: result.exitCode,
-        summary: result.summary
-      }, run.taskId);
+    this.store.updateFlowRun(updated);
+    this.syncTaskToFlowStatus(run.taskId, result.status, actor);
+    const bundle = this.store.getEvidenceBundleByRun(run.id);
+    this.store.insertEvidenceItem({
+      id: this.ids.next("item"),
+      bundleId: bundle.id,
+      kind: "summary",
+      name: "flow-result",
+      uri: `zigma://flow-runs/${run.id}`,
+      summary: result.summary ?? `Flow run finished with status ${result.status}`,
+      metadata: { externalRunId: result.externalRunId, exitCode: result.exitCode, ...result.metadata },
+      createdAt: now
     });
+    this.audit("flow-run", run.id, `flow-run.${result.status}`, actor, {
+      externalRunId: result.externalRunId,
+      exitCode: result.exitCode,
+      summary: result.summary
+    }, run.taskId);
   }
 
   private syncTaskToFlowStatus(taskId: string, status: FlowRun["status"], actor: { type: "user" | "agent" | "service" | "system"; id: string; displayName?: string; provider?: string; externalId?: string }, error?: { code: string; message: string; details: Record<string, unknown> }): void {
@@ -1090,18 +1636,28 @@ export class CoreService {
     return updated;
   }
 
-  private async collectWorkspaceEvidence(flowRunId: string, profile?: ExecutionProfile): Promise<void> {
+  private async collectWorkspaceEvidence(
+    flowRunId: string,
+    profile?: ExecutionProfile,
+    fence?: ExecutionLeaseFence
+  ): Promise<void> {
     const run = this.store.getFlowRun(flowRunId);
     if (!run.workspaceId || !this.workspaceProvider?.collectEvidence) return;
     const workspace = this.store.getWorkspace(run.workspaceId);
     const resolvedProfile = profile ?? this.store.getExecutionProfile(run.executionProfileId);
+    if (fence) this.assertMutatingProviderFence(fence);
     const evidence = await this.workspaceProvider.collectEvidence(workspace.externalId, {
       command: resolvedProfile.workspaceCommand,
       timeoutMs: resolvedProfile.timeoutMs,
-      environment: resolvedProfile.environment
+      environment: resolvedProfile.environment,
+      ...(fence ? { executionFence: fence } : {})
     });
     for (const item of evidence.items) {
-      this.addEvidenceItem(flowRunId, item);
+      if (fence) {
+        this.store.fencedTransaction(fence, this.clock.now(), () => this.addEvidenceItem(flowRunId, item));
+      } else {
+        this.addEvidenceItem(flowRunId, item);
+      }
     }
   }
 

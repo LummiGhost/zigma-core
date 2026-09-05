@@ -4,6 +4,7 @@ import {
   ExecutionPolicySchema,
   type ActorRef
 } from "../contracts/schemas.js";
+import type { ExecutionLeaseFence } from "../contracts/ports.js";
 import type {
   AuditEvent,
   EvidenceBundle,
@@ -168,7 +169,11 @@ export class SqliteStore {
         status TEXT NOT NULL,
         attempt INTEGER NOT NULL,
         payload_json TEXT NOT NULL,
+        provider_response_json TEXT,
         last_error TEXT,
+        dispatch_started_at TEXT,
+        cancel_requested_at TEXT,
+        cancel_acknowledged_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         completed_at TEXT,
@@ -185,6 +190,10 @@ export class SqliteStore {
         available_at TEXT NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
+        claim_owner_id TEXT,
+        claim_fencing_token INTEGER,
+        claimed_at TEXT,
+        claim_expires_at TEXT,
         delivered_at TEXT,
         last_error TEXT
       );
@@ -374,6 +383,32 @@ export class SqliteStore {
     const eventColumns = this.db.prepare("PRAGMA table_info(flow_events)").all() as Array<{ name: string }>;
     if (!eventColumns.some((column) => column.name === "event_hash")) {
       this.db.exec("ALTER TABLE flow_events ADD COLUMN event_hash TEXT");
+    }
+    const commandColumns = this.db.prepare("PRAGMA table_info(execution_commands)").all() as Array<{ name: string }>;
+    if (!commandColumns.some((column) => column.name === "provider_response_json")) {
+      this.db.exec("ALTER TABLE execution_commands ADD COLUMN provider_response_json TEXT");
+    }
+    if (!commandColumns.some((column) => column.name === "dispatch_started_at")) {
+      this.db.exec("ALTER TABLE execution_commands ADD COLUMN dispatch_started_at TEXT");
+    }
+    if (!commandColumns.some((column) => column.name === "cancel_requested_at")) {
+      this.db.exec("ALTER TABLE execution_commands ADD COLUMN cancel_requested_at TEXT");
+    }
+    if (!commandColumns.some((column) => column.name === "cancel_acknowledged_at")) {
+      this.db.exec("ALTER TABLE execution_commands ADD COLUMN cancel_acknowledged_at TEXT");
+    }
+    const outboxColumns = this.db.prepare("PRAGMA table_info(outbox_deliveries)").all() as Array<{ name: string }>;
+    if (!outboxColumns.some((column) => column.name === "claim_owner_id")) {
+      this.db.exec("ALTER TABLE outbox_deliveries ADD COLUMN claim_owner_id TEXT");
+    }
+    if (!outboxColumns.some((column) => column.name === "claim_fencing_token")) {
+      this.db.exec("ALTER TABLE outbox_deliveries ADD COLUMN claim_fencing_token INTEGER");
+    }
+    if (!outboxColumns.some((column) => column.name === "claimed_at")) {
+      this.db.exec("ALTER TABLE outbox_deliveries ADD COLUMN claimed_at TEXT");
+    }
+    if (!outboxColumns.some((column) => column.name === "claim_expires_at")) {
+      this.db.exec("ALTER TABLE outbox_deliveries ADD COLUMN claim_expires_at TEXT");
     }
   }
 
@@ -609,13 +644,17 @@ export class SqliteStore {
       id, operation_id, idempotency_key, input_hash, task_id, flow_run_id,
       project_id, repository_id, repository_url, base_ref, backend,
       workspace_policy_json, permission_snapshot_id, callback_correlation_id,
-      status, attempt, payload_json, last_error, created_at, updated_at, completed_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      status, attempt, payload_json, provider_response_json, last_error,
+      dispatch_started_at, cancel_requested_at, cancel_acknowledged_at,
+      created_at, updated_at, completed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       command.id, command.operationId, command.idempotencyKey ?? null, command.inputHash,
       command.taskId, command.flowRunId, command.projectId, command.repositoryId,
       command.repositoryUrl, command.baseRef, command.backend, toJson(command.workspacePolicy),
       command.permissionSnapshotId, command.callbackCorrelationId, command.status,
-      command.attempt, toJson(command.payload), command.lastError ?? null, command.createdAt,
+      command.attempt, toJson(command.payload), command.providerResponse ? toJson(command.providerResponse) : null,
+      command.lastError ?? null, command.dispatchStartedAt ?? null, command.cancelRequestedAt ?? null,
+      command.cancelAcknowledgedAt ?? null, command.createdAt,
       command.updatedAt, command.completedAt ?? null
     );
   }
@@ -631,8 +670,17 @@ export class SqliteStore {
     return rows.map((row) => this.mapExecutionCommand(row));
   }
 
+  listDueOutboxDeliveries(now: string): OutboxDelivery[] {
+    const rows = this.db.prepare(`SELECT * FROM outbox_deliveries
+      WHERE status = 'pending' AND available_at <= ? ORDER BY available_at ASC, created_at ASC, id ASC`).all(now) as Record<string, unknown>[];
+    return rows.map((row) => this.mapOutboxDelivery(row));
+  }
+
   listInFlightExecutionCommands(): ExecutionCommand[] {
-    const rows = this.db.prepare("SELECT * FROM execution_commands WHERE status IN ('leased', 'dispatched', 'reconciling') ORDER BY created_at ASC, id ASC").all() as Record<string, unknown>[];
+    const rows = this.db.prepare(`SELECT * FROM execution_commands
+      WHERE status IN ('leased', 'dispatching', 'dispatched', 'cancel_requested', 'reconciling')
+        OR id IN (SELECT command_id FROM execution_leases WHERE status != 'released')
+      ORDER BY created_at ASC, id ASC`).all() as Record<string, unknown>[];
     return rows.map((row) => this.mapExecutionCommand(row));
   }
 
@@ -648,9 +696,12 @@ export class SqliteStore {
 
   updateExecutionCommand(command: ExecutionCommand): void {
     this.db.prepare(`UPDATE execution_commands SET status = ?, attempt = ?, payload_json = ?,
-      last_error = ?, updated_at = ?, completed_at = ? WHERE id = ?`).run(
-      command.status, command.attempt, toJson(command.payload), command.lastError ?? null,
-      command.updatedAt, command.completedAt ?? null, command.id
+      provider_response_json = ?, last_error = ?, dispatch_started_at = ?,
+      cancel_requested_at = ?, cancel_acknowledged_at = ?, updated_at = ?, completed_at = ? WHERE id = ?`).run(
+      command.status, command.attempt, toJson(command.payload),
+      command.providerResponse ? toJson(command.providerResponse) : null, command.lastError ?? null,
+      command.dispatchStartedAt ?? null, command.cancelRequestedAt ?? null,
+      command.cancelAcknowledgedAt ?? null, command.updatedAt, command.completedAt ?? null, command.id
     );
   }
 
@@ -667,7 +718,11 @@ export class SqliteStore {
       callbackCorrelationId: String(row["callback_correlation_id"]),
       status: row["status"] as ExecutionCommand["status"], attempt: Number(row["attempt"]),
       payload: fromJson(row["payload_json"], {}),
+      ...(optionalString(row["provider_response_json"]) ? { providerResponse: fromJson(row["provider_response_json"], {}) } : {}),
       ...(optionalString(row["last_error"]) ? { lastError: optionalString(row["last_error"]) } : {}),
+      ...(optionalString(row["dispatch_started_at"]) ? { dispatchStartedAt: optionalString(row["dispatch_started_at"]) } : {}),
+      ...(optionalString(row["cancel_requested_at"]) ? { cancelRequestedAt: optionalString(row["cancel_requested_at"]) } : {}),
+      ...(optionalString(row["cancel_acknowledged_at"]) ? { cancelAcknowledgedAt: optionalString(row["cancel_acknowledged_at"]) } : {}),
       createdAt: String(row["created_at"]), updatedAt: String(row["updated_at"]),
       ...(optionalString(row["completed_at"]) ? { completedAt: optionalString(row["completed_at"]) } : {})
     };
@@ -676,25 +731,197 @@ export class SqliteStore {
   insertOutboxDelivery(delivery: OutboxDelivery): void {
     this.db.prepare(`INSERT INTO outbox_deliveries (
       id, topic, aggregate_id, payload_json, status, attempt, available_at,
-      created_at, updated_at, delivered_at, last_error
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      created_at, updated_at, claim_owner_id, claim_fencing_token, claimed_at,
+      claim_expires_at, delivered_at, last_error
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       delivery.id, delivery.topic, delivery.aggregateId, toJson(delivery.payload), delivery.status,
       delivery.attempt, delivery.availableAt, delivery.createdAt, delivery.updatedAt,
+      delivery.claimOwnerId ?? null, delivery.claimFencingToken ?? null,
+      delivery.claimedAt ?? null, delivery.claimExpiresAt ?? null,
       delivery.deliveredAt ?? null, delivery.lastError ?? null
     );
   }
 
   listOutboxDeliveries(): OutboxDelivery[] {
     const rows = this.db.prepare("SELECT * FROM outbox_deliveries ORDER BY created_at ASC").all() as Record<string, unknown>[];
-    return rows.map((row) => ({
+    return rows.map((row) => this.mapOutboxDelivery(row));
+  }
+
+  getOutboxDeliveryForCommand(commandId: string): OutboxDelivery | undefined {
+    const row = this.db.prepare("SELECT * FROM outbox_deliveries WHERE aggregate_id = ?").get(commandId) as Record<string, unknown> | undefined;
+    return row ? this.mapOutboxDelivery(row) : undefined;
+  }
+
+  private mapOutboxDelivery(row: Record<string, unknown>): OutboxDelivery {
+    return {
       id: String(row["id"]), topic: row["topic"] as OutboxDelivery["topic"],
       aggregateId: String(row["aggregate_id"]), payload: fromJson(row["payload_json"], {}),
       status: row["status"] as OutboxDelivery["status"], attempt: Number(row["attempt"]),
       availableAt: String(row["available_at"]), createdAt: String(row["created_at"]),
       updatedAt: String(row["updated_at"]),
+      ...(optionalString(row["claim_owner_id"]) ? { claimOwnerId: optionalString(row["claim_owner_id"]) } : {}),
+      ...(optionalNumber(row["claim_fencing_token"]) !== undefined ? { claimFencingToken: optionalNumber(row["claim_fencing_token"]) } : {}),
+      ...(optionalString(row["claimed_at"]) ? { claimedAt: optionalString(row["claimed_at"]) } : {}),
+      ...(optionalString(row["claim_expires_at"]) ? { claimExpiresAt: optionalString(row["claim_expires_at"]) } : {}),
       ...(optionalString(row["delivered_at"]) ? { deliveredAt: optionalString(row["delivered_at"]) } : {}),
       ...(optionalString(row["last_error"]) ? { lastError: optionalString(row["last_error"]) } : {})
-    }));
+    };
+  }
+
+  assertExecutionFence(fence: ExecutionLeaseFence, now: string): ExecutionLease {
+    const row = this.db.prepare("SELECT * FROM execution_leases WHERE command_id = ?").get(fence.commandId) as Record<string, unknown> | undefined;
+    if (!row) throw new NotFoundError("execution lease", fence.commandId);
+    const lease = this.mapExecutionLease(row);
+    if (
+      lease.id !== fence.leaseId
+      || lease.ownerId !== fence.ownerId
+      || lease.fencingToken !== fence.fencingToken
+      || lease.status !== "active"
+      || Date.parse(lease.expiresAt) <= Date.parse(now)
+    ) {
+      throw new ConflictError("Stale execution lease owner or fencing token", {
+        commandId: fence.commandId,
+        leaseId: fence.leaseId,
+        ownerId: fence.ownerId,
+        fencingToken: fence.fencingToken,
+        currentLeaseId: lease.id,
+        currentOwnerId: lease.ownerId,
+        currentFencingToken: lease.fencingToken,
+        status: lease.status,
+        expiresAt: lease.expiresAt,
+        now
+      });
+    }
+    return lease;
+  }
+
+  fencedTransaction<T>(fence: ExecutionLeaseFence, now: string, fn: () => T): T {
+    return this.transaction(() => {
+      this.assertExecutionFence(fence, now);
+      return fn();
+    });
+  }
+
+  claimOutboxDelivery(
+    deliveryId: string,
+    fence: ExecutionLeaseFence,
+    now: string,
+    claimExpiresAt: string
+  ): OutboxDelivery | undefined {
+    return this.fencedTransaction(fence, now, () => {
+      const row = this.db.prepare("SELECT * FROM outbox_deliveries WHERE id = ?").get(deliveryId) as Record<string, unknown> | undefined;
+      if (!row) throw new NotFoundError("outbox delivery", deliveryId);
+      const delivery = this.mapOutboxDelivery(row);
+      if (delivery.aggregateId !== fence.commandId) {
+        throw new ConflictError("Outbox delivery does not belong to the fenced command", {
+          deliveryId,
+          aggregateId: delivery.aggregateId,
+          commandId: fence.commandId
+        });
+      }
+      if (delivery.status !== "pending" || Date.parse(delivery.availableAt) > Date.parse(now)) return undefined;
+      this.db.prepare(`UPDATE outbox_deliveries SET status='claimed', attempt=attempt+1,
+        updated_at=?, claim_owner_id=?, claim_fencing_token=?, claimed_at=?, claim_expires_at=?,
+        delivered_at=NULL, last_error=NULL WHERE id=? AND status='pending'`).run(
+        now, fence.ownerId, fence.fencingToken, now, claimExpiresAt, deliveryId
+      );
+      return this.getOutboxDeliveryForCommand(fence.commandId);
+    });
+  }
+
+  acknowledgeOutboxDelivery(deliveryId: string, fence: ExecutionLeaseFence, now: string): OutboxDelivery {
+    return this.fencedTransaction(fence, now, () => {
+      const delivery = this.requireClaimedOutbox(deliveryId, fence);
+      const command = this.getExecutionCommand(fence.commandId);
+      if (!command.providerResponse) {
+        throw new ConflictError("Provider response must be durable before outbox acknowledgement", {
+          deliveryId,
+          commandId: command.id,
+          commandStatus: command.status,
+          providerResponsePersisted: command.providerResponse !== undefined
+        });
+      }
+      this.db.prepare(`UPDATE outbox_deliveries SET status='delivered', updated_at=?, delivered_at=?,
+        claim_expires_at=NULL, last_error=NULL WHERE id=?`).run(now, now, delivery.id);
+      return this.getOutboxDeliveryForCommand(fence.commandId)!;
+    });
+  }
+
+  releaseOutboxClaim(deliveryId: string, fence: ExecutionLeaseFence, now: string, lastError: string): OutboxDelivery {
+    return this.fencedTransaction(fence, now, () => {
+      const delivery = this.requireClaimedOutbox(deliveryId, fence);
+      this.db.prepare(`UPDATE outbox_deliveries SET status='pending', available_at=?, updated_at=?,
+        claim_owner_id=NULL, claim_fencing_token=NULL, claimed_at=NULL, claim_expires_at=NULL,
+        delivered_at=NULL, last_error=? WHERE id=?`).run(now, now, lastError, delivery.id);
+      return this.getOutboxDeliveryForCommand(fence.commandId)!;
+    });
+  }
+
+  failOutboxDelivery(deliveryId: string, fence: ExecutionLeaseFence, now: string, lastError: string): OutboxDelivery {
+    return this.fencedTransaction(fence, now, () => {
+      const delivery = this.requireClaimedOutbox(deliveryId, fence);
+      this.db.prepare(`UPDATE outbox_deliveries SET status='failed', updated_at=?, claim_expires_at=NULL,
+        last_error=? WHERE id=?`).run(now, lastError, delivery.id);
+      return this.getOutboxDeliveryForCommand(fence.commandId)!;
+    });
+  }
+
+  cancelOutboxDeliveryForCommand(commandId: string, now: string): OutboxDelivery | undefined {
+    const delivery = this.getOutboxDeliveryForCommand(commandId);
+    if (!delivery || ["delivered", "failed", "cancelled"].includes(delivery.status)) return delivery;
+    this.db.prepare(`UPDATE outbox_deliveries SET status='cancelled', updated_at=?,
+      claim_expires_at=NULL, last_error=NULL WHERE aggregate_id=?`).run(now, commandId);
+    return this.getOutboxDeliveryForCommand(commandId);
+  }
+
+  transferOutboxClaimToFence(commandId: string, fence: ExecutionLeaseFence, now: string, claimExpiresAt: string): void {
+    this.assertExecutionFence(fence, now);
+    this.db.prepare(`UPDATE outbox_deliveries SET claim_owner_id=?, claim_fencing_token=?,
+      claimed_at=?, claim_expires_at=?, updated_at=? WHERE aggregate_id=? AND status='claimed'`).run(
+      fence.ownerId, fence.fencingToken, now, claimExpiresAt, now, commandId
+    );
+  }
+
+  resetExecutionForRedispatch(commandId: string, fence: ExecutionLeaseFence, now: string, reason: string): void {
+    this.fencedTransaction(fence, now, () => {
+      const command = this.getExecutionCommand(commandId);
+      this.updateExecutionCommand({
+        ...command,
+        status: "pending",
+        providerResponse: undefined,
+        dispatchStartedAt: undefined,
+        lastError: reason,
+        updatedAt: now,
+        completedAt: undefined
+      });
+      this.db.prepare(`UPDATE outbox_deliveries SET status='pending', available_at=?, updated_at=?,
+        claim_owner_id=NULL, claim_fencing_token=NULL, claimed_at=NULL, claim_expires_at=NULL,
+        delivered_at=NULL, last_error=? WHERE aggregate_id=?`).run(now, now, reason, commandId);
+      const lease = this.getExecutionLease(commandId)!;
+      this.updateExecutionLease({ ...lease, status: "released", renewedAt: now, releasedAt: now });
+    });
+  }
+
+  private requireClaimedOutbox(deliveryId: string, fence: ExecutionLeaseFence): OutboxDelivery {
+    const row = this.db.prepare("SELECT * FROM outbox_deliveries WHERE id = ?").get(deliveryId) as Record<string, unknown> | undefined;
+    if (!row) throw new NotFoundError("outbox delivery", deliveryId);
+    const delivery = this.mapOutboxDelivery(row);
+    if (
+      delivery.status !== "claimed"
+      || delivery.aggregateId !== fence.commandId
+      || delivery.claimOwnerId !== fence.ownerId
+      || delivery.claimFencingToken !== fence.fencingToken
+    ) {
+      throw new ConflictError("Outbox claim is not owned by the execution fence", {
+        deliveryId,
+        status: delivery.status,
+        claimOwnerId: delivery.claimOwnerId,
+        claimFencingToken: delivery.claimFencingToken,
+        ownerId: fence.ownerId,
+        fencingToken: fence.fencingToken
+      });
+    }
+    return delivery;
   }
 
   admitExecutionCommand(input: {
@@ -716,7 +943,9 @@ export class SqliteStore {
         if (existing.status === "active" && Date.parse(existing.expiresAt) <= Date.parse(input.now)) {
           const reconciling = { ...existing, status: "reconciling" as const, renewedAt: input.now };
           this.updateExecutionLease(reconciling);
-          this.updateExecutionCommand({ ...command, status: "reconciling", updatedAt: input.now });
+          if (command.status !== "cancel_requested") {
+            this.updateExecutionCommand({ ...command, status: "reconciling", updatedAt: input.now });
+          }
           return { outcome: "reconcile", lease: reconciling };
         }
         if (existing.status === "active" && existing.ownerId === input.ownerId) {
@@ -763,14 +992,83 @@ export class SqliteStore {
     });
   }
 
-  releaseExecutionLease(commandId: string, ownerId: string, fencingToken: number, now: string): ExecutionLease {
+  renewExecutionLease(
+    fence: ExecutionLeaseFence,
+    now: string,
+    expiresAt: string
+  ): ExecutionLease {
     return this.transaction(() => {
-      const row = this.db.prepare("SELECT * FROM execution_leases WHERE command_id = ?").get(commandId) as Record<string, unknown> | undefined;
-      if (!row) throw new NotFoundError("execution lease", commandId);
-      const lease = this.mapExecutionLease(row);
-      if (lease.ownerId !== ownerId || lease.fencingToken !== fencingToken || lease.status !== "active") {
-        throw new ConflictError("Stale execution lease owner or fencing token", { commandId, ownerId, fencingToken, currentOwnerId: lease.ownerId, currentFencingToken: lease.fencingToken, status: lease.status });
+      const lease = this.assertExecutionFence(fence, now);
+      const renewed = { ...lease, renewedAt: now, expiresAt };
+      this.updateExecutionLease(renewed);
+      this.db.prepare(`UPDATE outbox_deliveries SET claim_expires_at=?, updated_at=?
+        WHERE aggregate_id=? AND status='claimed' AND claim_owner_id=? AND claim_fencing_token=?`).run(
+        expiresAt, now, fence.commandId, fence.ownerId, fence.fencingToken
+      );
+      return renewed;
+    });
+  }
+
+  takeoverExecutionLeaseForReconciliation(input: {
+    commandId: string;
+    leaseId: string;
+    ownerId: string;
+    now: string;
+    expiresAt: string;
+  }): ExecutionLease | undefined {
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM execution_leases WHERE command_id = ?").get(input.commandId) as Record<string, unknown> | undefined;
+      if (!row) return undefined;
+      const current = this.mapExecutionLease(row);
+      if (current.status === "released") return undefined;
+      if (current.status === "active" && Date.parse(current.expiresAt) > Date.parse(input.now)) return undefined;
+
+      const lease: ExecutionLease = {
+        ...current,
+        id: input.leaseId,
+        ownerId: input.ownerId,
+        fencingToken: current.fencingToken + 1,
+        status: "active",
+        acquiredAt: input.now,
+        renewedAt: input.now,
+        expiresAt: input.expiresAt,
+        releasedAt: undefined
+      };
+      this.db.prepare(`UPDATE execution_leases SET id=?, owner_id=?, fencing_token=?, status='active',
+        acquired_at=?, renewed_at=?, expires_at=?, released_at=NULL WHERE command_id=?`).run(
+        lease.id, lease.ownerId, lease.fencingToken, lease.acquiredAt,
+        lease.renewedAt, lease.expiresAt, input.commandId
+      );
+      const command = this.getExecutionCommand(input.commandId);
+      if (!["completed", "failed", "cancelled", "cancel_requested"].includes(command.status)) {
+        this.updateExecutionCommand({ ...command, status: "reconciling", updatedAt: input.now });
       }
+      this.db.prepare(`UPDATE outbox_deliveries SET claim_owner_id=?, claim_fencing_token=?,
+        claimed_at=?, claim_expires_at=?, updated_at=? WHERE aggregate_id=? AND status='claimed'`).run(
+        lease.ownerId, lease.fencingToken, input.now, input.expiresAt, input.now, input.commandId
+      );
+      return lease;
+    });
+  }
+
+  pauseExecutionLeaseForReconciliation(fence: ExecutionLeaseFence, now: string, reason: string): ExecutionLease {
+    return this.fencedTransaction(fence, now, () => {
+      const lease = this.getExecutionLease(fence.commandId)!;
+      const paused = { ...lease, status: "reconciling" as const, renewedAt: now };
+      this.updateExecutionLease(paused);
+      const command = this.getExecutionCommand(fence.commandId);
+      if (!["completed", "failed", "cancelled", "cancel_requested"].includes(command.status)) {
+        this.updateExecutionCommand({ ...command, status: "reconciling", lastError: reason, updatedAt: now });
+      } else if (command.status === "cancel_requested") {
+        this.updateExecutionCommand({ ...command, lastError: reason, updatedAt: now });
+      }
+      return paused;
+    });
+  }
+
+  releaseExecutionLease(fence: ExecutionLeaseFence, now: string): ExecutionLease {
+    return this.fencedTransaction(fence, now, () => {
+      const lease = this.getExecutionLease(fence.commandId)!;
       const released = { ...lease, status: "released" as const, renewedAt: now, releasedAt: now };
       this.updateExecutionLease(released);
       return released;
@@ -925,11 +1223,6 @@ export class SqliteStore {
       }
     }
     return result.changes === 1;
-  }
-
-  markOutboxDeliveredForCommand(commandId: string, now: string): void {
-    this.db.prepare(`UPDATE outbox_deliveries SET status='delivered', attempt=attempt+1,
-      updated_at=?, delivered_at=?, last_error=NULL WHERE aggregate_id=? AND status='pending'`).run(now, now, commandId);
   }
 
   upsertProviderWorkspaceHandle(handle: ProviderWorkspaceHandle): ProviderWorkspaceHandle {

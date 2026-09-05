@@ -152,6 +152,26 @@ describeRealProviders("M0 real sibling CLI contracts", () => {
         branchPatterns: ["zigma/*"]
       }
     });
+
+    await expect(executor.reconcile({
+      operationId: "command-real-contract",
+      executionFence: {
+        commandId: "command-real-contract",
+        leaseId: "lease-real-contract",
+        ownerId: "worker-real-contract",
+        fencingToken: 1
+      },
+      externalRunId: result.externalRunId,
+      command: flowCliPath!,
+      projectRoot,
+      timeoutMs: 60_000,
+      environment: {}
+    })).resolves.toMatchObject({
+      outcome: "found",
+      externalRunId: result.externalRunId,
+      status: "completed",
+      quiescent: true
+    });
   });
 
   it("consumes real Workspace patch/snapshot artifacts only after digest verification", async () => {
