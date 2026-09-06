@@ -106,7 +106,7 @@ Flow `callback-envelope-v1` events use a globally unique `eventId`, frozen
 command correlation, a bound external run id, and an ordered per-run sequence.
 The SQLite adapter persists the last accepted sequence and a unique
 `(flow_run_id, callback_sequence)` projection. It accepts exact event-id
-replays but rejects changed, stale, or skipped callbacks before a second state
+replays but rejects changed or stale callbacks before a second state
 transition or audit fact is written.
 
 Human Gates use a unique `(flow_run_id, external_gate_id)` key, and decisions use a unique `gate_id` key so retries reuse the persisted decision instead of creating duplicates.

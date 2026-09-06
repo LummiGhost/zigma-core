@@ -46,7 +46,8 @@ run(workspaceCliPath, ["contract-info", "--json"], workspaceRoot);
 run(process.execPath, [
   resolve(coreRoot, "node_modules", "vitest", "vitest.mjs"),
   "run",
-  "tests/adapters/m0-real-cli.contract.test.ts"
+  "tests/adapters/m0-real-cli.contract.test.ts",
+  "tests/adapters/m2-real-callback-delivery.contract.test.ts"
 ], coreRoot, {
   ...process.env,
   ZIGMA_FLOW_CLI_PATH: flowCliPath,
