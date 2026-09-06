@@ -903,13 +903,14 @@ describe("CoreService", () => {
     expect(() => core.recordFlowEvent(run.id, { ...event, payload: { sequence: 8 } })).toThrow(ConflictError);
     expect(() => core.recordFlowEvent(run.id, { ...event, eventId: "bad-correlation", callbackCorrelationId: "wrong" })).toThrow(ConflictError);
     expect(() => core.recordFlowEvent(run.id, { ...event, eventId: "wrong-run", flowRunId: "another-run", sequence: 2 })).toThrow(ConflictError);
-    expect(() => core.recordFlowEvent(run.id, { ...event, eventId: "out-of-order", sequence: 3 })).toThrow(ConflictError);
-    expect(() => core.recordFlowEvent(run.id, { ...event, eventId: "stale-sequence", sequence: 1 })).toThrow(ConflictError);
+    const forwardGap = core.recordFlowEvent(run.id, { ...event, eventId: "forward-gap", sequence: 3 });
+    expect(forwardGap.activeFlowRun?.lastCallbackSequence).toBe(3);
+    expect(() => core.recordFlowEvent(run.id, { ...event, eventId: "stale-sequence", sequence: 2 })).toThrow(ConflictError);
 
     const stale = core.recordFlowEvent(run.id, {
       contractVersion: 1, callbackVersion: 1, producer: "zigma-flow", eventId: "late-started", flowRunId: run.id, operationId: command.operationId,
       callbackCorrelationId: command.callbackCorrelationId, type: "run.started",
-      externalRunId: "zf-run-1", sequence: 2, occurredAt: "2026-07-20T01:00:00.000Z", payload: {}
+      externalRunId: "zf-run-1", sequence: 4, occurredAt: "2026-07-20T01:00:00.000Z", payload: {}
     });
     expect(stale.task.status).toBe("completed");
     expect(stale.activeFlowRun?.status).toBe("completed");

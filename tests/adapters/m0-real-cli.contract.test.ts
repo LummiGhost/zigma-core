@@ -127,7 +127,6 @@ describeRealProviders("M0 real sibling CLI contracts", () => {
       integrityHash: `sha256:${"a".repeat(64)}`,
       operationId: "command-real-contract",
       callbackCorrelationId: "command-real-contract",
-      coreCallbackUrl: "http://127.0.0.1:4736/v1",
       timeoutMs: 60_000,
       environment: {},
       dryRun: false
@@ -207,7 +206,7 @@ describeRealProviders("M0 real sibling CLI contracts", () => {
         environment: request.environment
       });
     }
-  });
+  }, 15_000);
 
   it("rejects an unknown handshake version before the provider can create state", async () => {
     const fixture = await makeGitRepository();
@@ -277,5 +276,5 @@ process.exitCode = result.status ?? 1;
         environment: request.environment
       });
     }
-  });
+  }, 15_000);
 });

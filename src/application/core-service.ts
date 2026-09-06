@@ -1195,11 +1195,6 @@ export class CoreService {
           flowRunId, sequence, lastCallbackSequence: currentRun.lastCallbackSequence
         });
       }
-      if (sequence !== currentRun.lastCallbackSequence + 1) {
-        throw new ConflictError("Flow callback sequence is out of order", {
-          flowRunId, sequence, expectedSequence: currentRun.lastCallbackSequence + 1
-        });
-      }
       if (currentRun.externalRunId && currentRun.externalRunId !== input.externalRunId) {
         throw new ConflictError("Flow callback external run identity does not match the bound Flow run", {
           flowRunId, externalRunId: input.externalRunId, boundExternalRunId: currentRun.externalRunId

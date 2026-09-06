@@ -55,9 +55,10 @@ Abort 响应不是进程终止证明。M2 execution lease 只在 dispatch 调用
 
 Flow 的 `callback-envelope-v1` 必须带 `contractVersion: 1`、`producer: "zigma-flow"`、
 `callbackVersion: 1`、`flowRunId`、
-`operationId`、`callbackCorrelationId`、`externalRunId` 和连续正整数 `sequence`，
+`operationId`、`callbackCorrelationId`、`externalRunId` 和单调递增正整数 `sequence`，
 也可带 managed Run/Job-attempt workspace handle 和 evidence。Core 校验冻结的
-command identity、route/body Flow run 一致性、外部 run 一次绑定和严格顺序；仅完全
+command identity、route/body Flow run 一致性、外部 run 一次绑定和单调顺序；Flow
+只投影部分内部事件，因此允许向前跳号但拒绝旧序号与回退；仅完全
 相同的 envelope 可重放，然后投影 handle/evidence。Flow 仍是 Job/attempt 状态权威，
 Workspace 仍是 worktree、快照、reconcile 和 cleanup 权威。
 

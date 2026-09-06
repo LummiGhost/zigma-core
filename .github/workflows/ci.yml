@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: LummiGhost/zigma-flow
-          ref: 9e6c9957f6bce274d56c37dc37f69b7246ead0dc
+          ref: 771734ff404a0f8d7a04b2a7f685af9a07a9ad9c
           path: .providers/zigma-flow
       - run: pnpm install --frozen-lockfile
         working-directory: .providers/zigma-flow
