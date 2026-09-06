@@ -161,6 +161,8 @@ export interface FlowRun {
   externalRunId?: string;
   status: FlowRunStatus;
   attempt: number;
+  /** Last accepted V1 Core callback sequence; zero before the first callback. */
+  lastCallbackSequence: number;
   inputs: Record<string, string>;
   context: Record<string, unknown>;
   exitCode?: number;

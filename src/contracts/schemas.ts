@@ -209,9 +209,14 @@ export const FlowRunStatusSchema = z.enum([
 export type FlowRunStatus = z.infer<typeof FlowRunStatusSchema>;
 
 export const RecordFlowEventInputSchema = z.object({
+  contractVersion: z.literal(1).optional(),
+  callbackVersion: z.literal(1).optional(),
+  producer: z.literal("zigma-flow").optional(),
   eventId: IdSchema,
+  flowRunId: IdSchema.optional(),
   operationId: IdSchema.optional(),
   callbackCorrelationId: IdSchema.optional(),
+  sequence: z.number().int().positive().optional(),
   externalRunId: z.string().min(1).optional(),
   type: z.enum([
     "run.started",
@@ -257,6 +262,20 @@ export const RecordFlowEventInputSchema = z.object({
 }).superRefine((value, ctx) => {
   if (value.workspace?.scope === "job-attempt" && (!value.workspace.jobId || !value.workspace.attempt)) {
     ctx.addIssue({ code: "custom", path: ["workspace"], message: "job-attempt workspace requires jobId and attempt" });
+  }
+  const usesCoreCorrelation = value.callbackVersion !== undefined
+    || value.operationId !== undefined
+    || value.callbackCorrelationId !== undefined
+    || value.sequence !== undefined;
+  if (usesCoreCorrelation) {
+    if (value.contractVersion !== 1) ctx.addIssue({ code: "custom", path: ["contractVersion"], message: "Core callbacks require contractVersion: 1" });
+    if (value.callbackVersion !== 1) ctx.addIssue({ code: "custom", path: ["callbackVersion"], message: "Core callbacks require callbackVersion: 1" });
+    if (value.producer !== "zigma-flow") ctx.addIssue({ code: "custom", path: ["producer"], message: "Core callbacks require producer: zigma-flow" });
+    if (!value.operationId) ctx.addIssue({ code: "custom", path: ["operationId"], message: "Core callbacks require operationId" });
+    if (!value.callbackCorrelationId) ctx.addIssue({ code: "custom", path: ["callbackCorrelationId"], message: "Core callbacks require callbackCorrelationId" });
+    if (!value.flowRunId) ctx.addIssue({ code: "custom", path: ["flowRunId"], message: "Core callbacks require flowRunId" });
+    if (!value.externalRunId) ctx.addIssue({ code: "custom", path: ["externalRunId"], message: "Core callbacks require externalRunId" });
+    if (!value.sequence) ctx.addIssue({ code: "custom", path: ["sequence"], message: "Core callbacks require a positive sequence" });
   }
 });
 export type RecordFlowEventInput = z.input<typeof RecordFlowEventInputSchema>;

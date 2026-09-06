@@ -20,7 +20,8 @@ const FLOW_PROVIDER = "zigma-flow";
 const REQUIRED_FLOW_CAPABILITIES = [
   "caller-context-v1",
   "invoke-json-v1",
-  "context-freeze-v1"
+  "context-freeze-v1",
+  "callback-envelope-v1"
 ] as const;
 const FLOW_INSPECT_CAPABILITY = "run-inspect-v1";
 

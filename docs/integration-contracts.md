@@ -53,10 +53,13 @@ ID 和 integrity hash。Core 不会把缺失的 permission evidence 降级为 `n
 Abort 响应不是进程终止证明。M2 execution lease 只在 dispatch 调用返回后释放；
 超时或结果不确定的 invocation 进入 `reconciling`，不盲目重跑或提前 cleanup。
 
-Flow callback 可带 `operationId`、`callbackCorrelationId`、managed Run/Job-attempt
-workspace handle 和 evidence。Core 校验 correlation、按 event id 幂等消费并投影
-handle/evidence；Flow 仍是 Job/attempt 状态权威，Workspace 仍是 worktree、快照、
-reconcile 和 cleanup 权威。
+Flow 的 `callback-envelope-v1` 必须带 `contractVersion: 1`、`producer: "zigma-flow"`、
+`callbackVersion: 1`、`flowRunId`、
+`operationId`、`callbackCorrelationId`、`externalRunId` 和连续正整数 `sequence`，
+也可带 managed Run/Job-attempt workspace handle 和 evidence。Core 校验冻结的
+command identity、route/body Flow run 一致性、外部 run 一次绑定和严格顺序；仅完全
+相同的 envelope 可重放，然后投影 handle/evidence。Flow 仍是 Job/attempt 状态权威，
+Workspace 仍是 worktree、快照、reconcile 和 cleanup 权威。
 
 ### Workspace
 
