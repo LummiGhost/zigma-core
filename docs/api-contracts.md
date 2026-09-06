@@ -190,18 +190,33 @@ The current local adapter executes synchronously, though the transport returns H
 
 ### `POST /flow-runs/:id/events`
 
-Provides an idempotent status callback contract for `zigma-flow` or a future execution host.
+Provides the versioned, at-least-once callback contract for `zigma-flow`.
+For `callbackVersion: 1`, Core requires the route id and body `flowRunId` to
+match, and requires the frozen command identity plus a strictly increasing
+per-run sequence. Replaying the exact envelope succeeds; a reused event id,
+old sequence, skipped sequence, or changed identity is rejected.
 
 ```json
 {
+  "contractVersion": 1,
+  "callbackVersion": 1,
+  "producer": "zigma-flow",
   "eventId": "event-019...",
+  "flowRunId": "flowrun_...",
+  "operationId": "command_...",
+  "callbackCorrelationId": "correlation_...",
   "externalRunId": "2026-07-20T...",
+  "sequence": 1,
   "type": "run.completed",
   "occurredAt": "2026-07-20T03:00:00.000Z",
   "summary": "All jobs completed",
   "payload": {}
 }
 ```
+
+`externalRunId` is bound on the first accepted V1 callback and cannot change
+for that Flow run. The full envelope, not only its `eventId`, is the replay
+identity.
 
 Event types:
 

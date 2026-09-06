@@ -141,6 +141,7 @@ export class SqliteStore {
         external_run_id TEXT,
         status TEXT NOT NULL,
         attempt INTEGER NOT NULL,
+        last_callback_sequence INTEGER NOT NULL DEFAULT 0,
         inputs_json TEXT NOT NULL,
         context_json TEXT NOT NULL,
         exit_code INTEGER,
@@ -241,6 +242,7 @@ export class SqliteStore {
         occurred_at TEXT NOT NULL,
         payload_json TEXT NOT NULL,
         event_hash TEXT,
+        callback_sequence INTEGER,
         created_at TEXT NOT NULL
       );
 
@@ -383,6 +385,14 @@ export class SqliteStore {
     const eventColumns = this.db.prepare("PRAGMA table_info(flow_events)").all() as Array<{ name: string }>;
     if (!eventColumns.some((column) => column.name === "event_hash")) {
       this.db.exec("ALTER TABLE flow_events ADD COLUMN event_hash TEXT");
+    }
+    if (!eventColumns.some((column) => column.name === "callback_sequence")) {
+      this.db.exec("ALTER TABLE flow_events ADD COLUMN callback_sequence INTEGER");
+    }
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_flow_events_run_sequence ON flow_events(flow_run_id, callback_sequence) WHERE callback_sequence IS NOT NULL");
+    const flowRunColumns = this.db.prepare("PRAGMA table_info(flow_runs)").all() as Array<{ name: string }>;
+    if (!flowRunColumns.some((column) => column.name === "last_callback_sequence")) {
+      this.db.exec("ALTER TABLE flow_runs ADD COLUMN last_callback_sequence INTEGER NOT NULL DEFAULT 0");
     }
     const commandColumns = this.db.prepare("PRAGMA table_info(execution_commands)").all() as Array<{ name: string }>;
     if (!commandColumns.some((column) => column.name === "provider_response_json")) {
@@ -616,9 +626,9 @@ export class SqliteStore {
   insertFlowRun(run: FlowRun): void {
     this.db.prepare(`INSERT INTO flow_runs (
       id, task_id, workflow_ref, execution_profile_id, permission_snapshot_id,
-      workspace_id, external_run_id, status, attempt, inputs_json, context_json,
+      workspace_id, external_run_id, status, attempt, last_callback_sequence, inputs_json, context_json,
       exit_code, error_json, started_at, created_at, updated_at, completed_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       run.id,
       run.taskId,
       run.workflowRef,
@@ -628,6 +638,7 @@ export class SqliteStore {
       run.externalRunId ?? null,
       run.status,
       run.attempt,
+      run.lastCallbackSequence,
       toJson(run.inputs),
       toJson(run.context),
       run.exitCode ?? null,
@@ -1124,6 +1135,7 @@ export class SqliteStore {
       ...(optionalString(row["external_run_id"]) ? { externalRunId: optionalString(row["external_run_id"]) } : {}),
       status: row["status"] as FlowRun["status"],
       attempt: Number(row["attempt"]),
+      lastCallbackSequence: Number(row["last_callback_sequence"] ?? 0),
       inputs: fromJson(row["inputs_json"], {}),
       context: fromJson(row["context_json"], {}),
       ...(optionalNumber(row["exit_code"]) !== undefined ? { exitCode: optionalNumber(row["exit_code"]) } : {}),
@@ -1137,12 +1149,13 @@ export class SqliteStore {
 
   updateFlowRun(run: FlowRun): void {
     this.db.prepare(`UPDATE flow_runs SET
-      workspace_id = ?, external_run_id = ?, status = ?, context_json = ?,
+      workspace_id = ?, external_run_id = ?, status = ?, last_callback_sequence = ?, context_json = ?,
       exit_code = ?, error_json = ?, started_at = ?, updated_at = ?, completed_at = ?
       WHERE id = ?`).run(
         run.workspaceId ?? null,
         run.externalRunId ?? null,
         run.status,
+        run.lastCallbackSequence,
         toJson(run.context),
         run.exitCode ?? null,
         run.error ? toJson(run.error) : null,
@@ -1211,14 +1224,15 @@ export class SqliteStore {
     );
   }
 
-  insertFlowEvent(event: { id: string; flowRunId: string; type: string; occurredAt: string; payload: Record<string, unknown>; inputHash: string; createdAt: string }): boolean {
-    const result = this.db.prepare(`INSERT OR IGNORE INTO flow_events (id, flow_run_id, type, occurred_at, payload_json, event_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+  insertFlowEvent(event: { id: string; flowRunId: string; type: string; occurredAt: string; payload: Record<string, unknown>; inputHash: string; callbackSequence?: number; createdAt: string }): boolean {
+    const result = this.db.prepare(`INSERT OR IGNORE INTO flow_events (id, flow_run_id, type, occurred_at, payload_json, event_hash, callback_sequence, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
       event.id,
       event.flowRunId,
       event.type,
       event.occurredAt,
       toJson(event.payload),
       event.inputHash,
+      event.callbackSequence ?? null,
       event.createdAt
     );
     if (result.changes === 0) {
@@ -1230,10 +1244,22 @@ export class SqliteStore {
     return result.changes === 1;
   }
 
+  getFlowEvent(eventId: string): { flowRunId: string; inputHash?: string } | undefined {
+    const row = this.db.prepare("SELECT flow_run_id, event_hash FROM flow_events WHERE id = ?").get(eventId) as Record<string, unknown> | undefined;
+    return row ? { flowRunId: String(row["flow_run_id"]), ...(optionalString(row["event_hash"]) ? { inputHash: optionalString(row["event_hash"]) } : {}) } : undefined;
+  }
+
   upsertProviderWorkspaceHandle(handle: ProviderWorkspaceHandle): ProviderWorkspaceHandle {
     const existing = this.db.prepare("SELECT * FROM provider_workspace_handles WHERE provider = ? AND external_id = ?").get(handle.provider, handle.externalId) as Record<string, unknown> | undefined;
-    if (existing && existing["flow_run_id"] !== handle.flowRunId) {
-      throw new ConflictError("Provider workspace handle belongs to a different Flow run", { provider: handle.provider, externalId: handle.externalId });
+    if (existing && (
+      existing["flow_run_id"] !== handle.flowRunId
+      || existing["scope"] !== handle.scope
+      || (existing["job_id"] ?? undefined) !== handle.jobId
+      || (existing["attempt"] ?? undefined) !== handle.attempt
+    )) {
+      throw new ConflictError("Provider workspace handle identity is immutable", {
+        provider: handle.provider, externalId: handle.externalId, flowRunId: handle.flowRunId
+      });
     }
     this.db.prepare(`INSERT INTO provider_workspace_handles (
       id, flow_run_id, provider, external_id, scope, job_id, attempt, status, path,

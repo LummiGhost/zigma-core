@@ -849,21 +849,17 @@ describe("CoreService", () => {
     expect(flow.decisions).toHaveLength(1);
     expect(core.getTask(task.id).status).toBe("running");
 
-    const completed = core.recordFlowEvent(run.id, {
+    const completedEvent = {
       eventId: "event-completed",
-      type: "run.completed",
+      type: "run.completed" as const,
       occurredAt: "2026-07-20T01:00:00.000Z",
       externalRunId: "zf-paused",
       payload: {}
-    });
+    };
+    const completed = core.recordFlowEvent(run.id, completedEvent);
     expect(completed.task.status).toBe("completed");
 
-    const duplicate = core.recordFlowEvent(run.id, {
-      eventId: "event-completed",
-      type: "run.completed",
-      occurredAt: "2026-07-20T01:00:00.000Z",
-      payload: {}
-    });
+    const duplicate = core.recordFlowEvent(run.id, completedEvent);
     expect(duplicate.task.status).toBe("completed");
   });
 
@@ -873,9 +869,15 @@ describe("CoreService", () => {
     const run = started.activeFlowRun!;
     const command = started.executionCommand!;
     const event = {
+      contractVersion: 1 as const,
+      callbackVersion: 1 as const,
+      producer: "zigma-flow" as const,
       eventId: "workspace-event-1",
+      flowRunId: run.id,
       operationId: command.operationId,
       callbackCorrelationId: command.callbackCorrelationId,
+      externalRunId: "zf-run-1",
+      sequence: 1,
       type: "run.progress" as const,
       occurredAt: "2026-07-20T02:00:00.000Z",
       workspace: {
@@ -891,6 +893,7 @@ describe("CoreService", () => {
     const projected = core.recordFlowEvent(run.id, event);
     const duplicate = core.recordFlowEvent(run.id, event);
     expect(duplicate.workspaceHandles).toEqual(projected.workspaceHandles);
+    expect(projected.activeFlowRun?.lastCallbackSequence).toBe(1);
     expect(projected.workspaceHandles).toEqual([expect.objectContaining({
       externalId: "ws-job-build-2", scope: "job-attempt", jobId: "build", attempt: 2,
       status: "snapshotted", lastEventId: "workspace-event-1"
@@ -899,11 +902,14 @@ describe("CoreService", () => {
 
     expect(() => core.recordFlowEvent(run.id, { ...event, payload: { sequence: 8 } })).toThrow(ConflictError);
     expect(() => core.recordFlowEvent(run.id, { ...event, eventId: "bad-correlation", callbackCorrelationId: "wrong" })).toThrow(ConflictError);
+    expect(() => core.recordFlowEvent(run.id, { ...event, eventId: "wrong-run", flowRunId: "another-run", sequence: 2 })).toThrow(ConflictError);
+    expect(() => core.recordFlowEvent(run.id, { ...event, eventId: "out-of-order", sequence: 3 })).toThrow(ConflictError);
+    expect(() => core.recordFlowEvent(run.id, { ...event, eventId: "stale-sequence", sequence: 1 })).toThrow(ConflictError);
 
     const stale = core.recordFlowEvent(run.id, {
-      eventId: "late-started", operationId: command.operationId,
+      contractVersion: 1, callbackVersion: 1, producer: "zigma-flow", eventId: "late-started", flowRunId: run.id, operationId: command.operationId,
       callbackCorrelationId: command.callbackCorrelationId, type: "run.started",
-      occurredAt: "2026-07-20T01:00:00.000Z", payload: {}
+      externalRunId: "zf-run-1", sequence: 2, occurredAt: "2026-07-20T01:00:00.000Z", payload: {}
     });
     expect(stale.task.status).toBe("completed");
     expect(stale.activeFlowRun?.status).toBe("completed");

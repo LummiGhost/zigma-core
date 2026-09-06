@@ -349,6 +349,7 @@ export class CoreService {
       permissionSnapshotId: permissionSnapshot.id,
       status: "created",
       attempt: existingRuns.length + 1,
+      lastCallbackSequence: 0,
       inputs: input.inputs,
       context: {
         zigmaCoreTaskId: task.id,
@@ -1148,38 +1149,100 @@ export class CoreService {
     const now = this.clock.now();
     const run = this.store.getFlowRun(flowRunId);
     const command = this.store.getExecutionCommandForRun(flowRunId);
+    if (input.flowRunId && input.flowRunId !== flowRunId) {
+      throw new ConflictError("Flow callback flowRunId does not match the callback target", { flowRunId, callbackFlowRunId: input.flowRunId });
+    }
     if (input.operationId && input.operationId !== command?.operationId) {
       throw new ConflictError("Flow event operationId does not match the execution command", { flowRunId, operationId: input.operationId });
     }
     if (input.callbackCorrelationId && input.callbackCorrelationId !== command?.callbackCorrelationId) {
       throw new ConflictError("Flow event callback correlation does not match the execution command", { flowRunId, callbackCorrelationId: input.callbackCorrelationId });
     }
+    if (input.externalRunId && run.externalRunId && input.externalRunId !== run.externalRunId) {
+      throw new ConflictError("Flow callback external run identity does not match the bound Flow run", {
+        flowRunId, externalRunId: input.externalRunId, boundExternalRunId: run.externalRunId
+      });
+    }
+    const callbackHash = stableHash({
+      contractVersion: input.contractVersion,
+      callbackVersion: input.callbackVersion,
+      producer: input.producer,
+      eventId: input.eventId,
+      operationId: input.operationId,
+      callbackCorrelationId: input.callbackCorrelationId,
+      externalRunId: input.externalRunId,
+      sequence: input.sequence,
+      type: input.type,
+      occurredAt: input.occurredAt,
+      status: input.status,
+      summary: input.summary,
+      error: input.error,
+      workspace: input.workspace,
+      evidence: input.evidence,
+      payload: input.payload
+    });
     return this.store.transaction(() => {
+    let currentRun = this.store.getFlowRun(flowRunId);
+    if (input.callbackVersion === 1) {
+      const sequence = input.sequence!;
+      const existing = this.store.getFlowEvent(input.eventId);
+      if (existing) {
+        if (existing.flowRunId === flowRunId && existing.inputHash === callbackHash) return this.getTaskView(currentRun.taskId);
+        throw new ConflictError("Flow event id was reused with different content", { eventId: input.eventId, flowRunId });
+      }
+      if (sequence <= currentRun.lastCallbackSequence) {
+        throw new ConflictError("Flow callback sequence is stale", {
+          flowRunId, sequence, lastCallbackSequence: currentRun.lastCallbackSequence
+        });
+      }
+      if (sequence !== currentRun.lastCallbackSequence + 1) {
+        throw new ConflictError("Flow callback sequence is out of order", {
+          flowRunId, sequence, expectedSequence: currentRun.lastCallbackSequence + 1
+        });
+      }
+      if (currentRun.externalRunId && currentRun.externalRunId !== input.externalRunId) {
+        throw new ConflictError("Flow callback external run identity does not match the bound Flow run", {
+          flowRunId, externalRunId: input.externalRunId, boundExternalRunId: currentRun.externalRunId
+        });
+      }
+    }
     const inserted = this.store.insertFlowEvent({
       id: input.eventId, flowRunId, type: input.type, occurredAt: input.occurredAt,
       payload: input.payload,
-      inputHash: stableHash({ type: input.type, occurredAt: input.occurredAt, payload: input.payload }),
+      inputHash: callbackHash,
+      ...(input.sequence !== undefined ? { callbackSequence: input.sequence } : {}),
       createdAt: now
     });
-    if (!inserted) return this.getTaskView(run.taskId);
+    if (!inserted) return this.getTaskView(currentRun.taskId);
+
+    if (input.callbackVersion === 1) {
+      currentRun = {
+        ...currentRun,
+        lastCallbackSequence: input.sequence!,
+        externalRunId: input.externalRunId!,
+        updatedAt: now
+      };
+    }
 
     const actor = SYSTEM_ACTOR;
     const targetStatus = this.statusForEvent(input.type, input.status);
     const updatedAt = input.occurredAt;
-    const runIsTerminal = ["completed", "failed", "cancelled"].includes(run.status);
+    const runIsTerminal = ["completed", "failed", "cancelled"].includes(currentRun.status);
     const targetIsTerminal = targetStatus ? ["completed", "failed", "cancelled"].includes(targetStatus) : false;
     if (targetStatus && !(runIsTerminal && !targetIsTerminal)) {
-      assertFlowTransition(run.status, targetStatus);
+      assertFlowTransition(currentRun.status, targetStatus);
       const terminal = ["completed", "failed", "cancelled"].includes(targetStatus);
       this.store.updateFlowRun({
-        ...run,
+        ...currentRun,
         status: targetStatus,
         ...(input.externalRunId !== undefined ? { externalRunId: input.externalRunId } : {}),
         ...(input.error !== undefined ? { error: input.error } : {}),
         updatedAt,
         ...(terminal ? { completedAt: updatedAt } : {})
       });
-      this.syncTaskToFlowStatus(run.taskId, targetStatus, actor, input.error);
+      this.syncTaskToFlowStatus(currentRun.taskId, targetStatus, actor, input.error);
+    } else if (input.callbackVersion === 1) {
+      this.store.updateFlowRun(currentRun);
     }
     if (input.workspace) {
       this.store.upsertProviderWorkspaceHandle({
@@ -1203,8 +1266,8 @@ export class CoreService {
       ignoredStaleTransition: runIsTerminal && !targetIsTerminal,
       summary: input.summary,
       payload: input.payload
-    }, run.taskId, input.eventId);
-    return this.getTaskView(run.taskId);
+    }, currentRun.taskId, input.eventId);
+    return this.getTaskView(currentRun.taskId);
     });
   }
 

@@ -15,7 +15,7 @@ function contractInfo(overrides: Record<string, unknown> = {}) {
       contractVersion: 1,
       provider: "zigma-flow",
       packageVersion: "0.8.12",
-      capabilities: ["caller-context-v1", "invoke-json-v1", "context-freeze-v1"],
+      capabilities: ["caller-context-v1", "invoke-json-v1", "context-freeze-v1", "callback-envelope-v1"],
       ...overrides
     }),
     exitCode: 0
@@ -366,7 +366,7 @@ describe("LocalCliFlowExecutor command contracts", () => {
   it("negotiates run-inspect-v1 and accepts only correlated quiescent evidence", async () => {
     mockExeca.mockReset();
     mockExeca.mockResolvedValueOnce(contractInfo({
-      capabilities: ["caller-context-v1", "invoke-json-v1", "context-freeze-v1", "run-inspect-v1"]
+      capabilities: ["caller-context-v1", "invoke-json-v1", "context-freeze-v1", "callback-envelope-v1", "run-inspect-v1"]
     }));
     mockExeca.mockResolvedValueOnce({
       stdout: JSON.stringify({
