@@ -864,7 +864,13 @@ describe("CoreService", () => {
   });
 
   it("deduplicates correlated callbacks and projects job workspace evidence without owning job state", async () => {
-    const { core, task } = setup();
+    const { core, flow, store, task, clock, ids } = setup();
+    flow.result = {
+      externalRunId: "zf-run-1",
+      status: "running",
+      exitCode: 0,
+      metadata: {}
+    };
     const started = await core.startTask(task.id, { ...startInput(), idempotencyKey: "callback-projection" });
     const run = started.activeFlowRun!;
     const command = started.executionCommand!;
@@ -903,17 +909,47 @@ describe("CoreService", () => {
     expect(() => core.recordFlowEvent(run.id, { ...event, payload: { sequence: 8 } })).toThrow(ConflictError);
     expect(() => core.recordFlowEvent(run.id, { ...event, eventId: "bad-correlation", callbackCorrelationId: "wrong" })).toThrow(ConflictError);
     expect(() => core.recordFlowEvent(run.id, { ...event, eventId: "wrong-run", flowRunId: "another-run", sequence: 2 })).toThrow(ConflictError);
-    const forwardGap = core.recordFlowEvent(run.id, { ...event, eventId: "forward-gap", sequence: 3 });
-    expect(forwardGap.activeFlowRun?.lastCallbackSequence).toBe(3);
-    expect(() => core.recordFlowEvent(run.id, { ...event, eventId: "stale-sequence", sequence: 2 })).toThrow(ConflictError);
+    expect(() => core.recordFlowEvent(run.id, { ...event, eventId: "forward-gap", sequence: 3 })).toThrow(
+      expect.objectContaining({ code: "CONFLICT", details: expect.objectContaining({ expectedSequence: 2 }) }),
+    );
+    expect(store.getFlowRun(run.id).lastCallbackSequence).toBe(1);
+    expect(() => core.recordFlowEvent(run.id, { ...event, eventId: "duplicate-sequence", sequence: 1 })).toThrow(ConflictError);
 
-    const stale = core.recordFlowEvent(run.id, {
-      contractVersion: 1, callbackVersion: 1, producer: "zigma-flow", eventId: "late-started", flowRunId: run.id, operationId: command.operationId,
-      callbackCorrelationId: command.callbackCorrelationId, type: "run.started",
-      externalRunId: "zf-run-1", sequence: 4, occurredAt: "2026-07-20T01:00:00.000Z", payload: {}
+    const restartedCore = new CoreService({
+      store,
+      flowExecutor: flow,
+      workspaceProvider: new FakeWorkspace(),
+      clock,
+      ids,
     });
-    expect(stale.task.status).toBe("completed");
-    expect(stale.activeFlowRun?.status).toBe("completed");
+    expect(restartedCore.recordFlowEvent(run.id, event).workspaceHandles).toEqual(projected.workspaceHandles);
+
+    const completed = restartedCore.recordFlowEvent(run.id, {
+      contractVersion: 1, callbackVersion: 1, producer: "zigma-flow", eventId: "completed", flowRunId: run.id, operationId: command.operationId,
+      callbackCorrelationId: command.callbackCorrelationId, type: "run.completed",
+      status: "completed", externalRunId: "zf-run-1", sequence: 2, occurredAt: "2026-07-20T03:00:00.000Z", payload: {}
+    });
+    expect(completed.task.status).toBe("completed");
+    expect(completed.activeFlowRun).toMatchObject({ status: "completed", lastCallbackSequence: 2 });
+  });
+
+  it("classifies a persisted callback sequence collision without dereferencing a missing event id", async () => {
+    const { core, flow, store, task } = setup();
+    flow.result = { externalRunId: "zf-run-1", status: "running", exitCode: 0, metadata: {} };
+    const run = (await core.startTask(task.id, startInput())).activeFlowRun!;
+    const first = {
+      id: "event-a", flowRunId: run.id, type: "run.progress",
+      occurredAt: "2026-07-20T02:00:00.000Z", payload: {}, inputHash: "hash-a",
+      callbackSequence: 1, createdAt: "2026-07-20T02:00:00.000Z"
+    };
+    expect(store.insertFlowEvent(first)).toBe(true);
+
+    expect(() => store.insertFlowEvent({ ...first, id: "event-b", inputHash: "hash-b" })).toThrow(
+      expect.objectContaining({
+        code: "CONFLICT",
+        details: expect.objectContaining({ sequence: 1, eventId: "event-b", existingEventId: "event-a" })
+      }),
+    );
   });
 
   it("keeps failed human gate delivery retryable and finalizes it after retry", async () => {

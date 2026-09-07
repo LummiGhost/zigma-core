@@ -1190,9 +1190,10 @@ export class CoreService {
         if (existing.flowRunId === flowRunId && existing.inputHash === callbackHash) return this.getTaskView(currentRun.taskId);
         throw new ConflictError("Flow event id was reused with different content", { eventId: input.eventId, flowRunId });
       }
-      if (sequence <= currentRun.lastCallbackSequence) {
-        throw new ConflictError("Flow callback sequence is stale", {
-          flowRunId, sequence, lastCallbackSequence: currentRun.lastCallbackSequence
+      const expectedSequence = currentRun.lastCallbackSequence + 1;
+      if (sequence !== expectedSequence) {
+        throw new ConflictError("Flow callback sequence is not contiguous", {
+          flowRunId, sequence, expectedSequence, lastCallbackSequence: currentRun.lastCallbackSequence
         });
       }
       if (currentRun.externalRunId && currentRun.externalRunId !== input.externalRunId) {

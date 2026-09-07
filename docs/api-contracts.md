@@ -192,10 +192,10 @@ The current local adapter executes synchronously, though the transport returns H
 
 Provides the versioned, at-least-once callback contract for `zigma-flow`.
 For `callbackVersion: 1`, Core requires the route id and body `flowRunId` to
-match, and requires the frozen command identity plus a strictly increasing
-per-run sequence. Sequence gaps are valid because Flow projects only selected
-internal events. Replaying the exact envelope succeeds; a reused event id,
-stale sequence, or changed identity is rejected.
+match, and requires the frozen command identity plus a contiguous per-run
+sequence. Flow delivers every authoritative event, so the next sequence must
+be exactly `last + 1`. Replaying the exact envelope succeeds; a reused event
+id, reused sequence, skipped/stale sequence, or changed identity is rejected.
 
 ```json
 {

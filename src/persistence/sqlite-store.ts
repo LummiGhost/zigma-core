@@ -1236,10 +1236,30 @@ export class SqliteStore {
       event.createdAt
     );
     if (result.changes === 0) {
-      const existing = this.db.prepare("SELECT flow_run_id, event_hash FROM flow_events WHERE id = ?").get(event.id) as Record<string, unknown>;
-      if (existing["flow_run_id"] !== event.flowRunId || (existing["event_hash"] && existing["event_hash"] !== event.inputHash)) {
+      const existing = this.db.prepare("SELECT flow_run_id, event_hash FROM flow_events WHERE id = ?").get(event.id) as Record<string, unknown> | undefined;
+      if (existing) {
+        if (existing["flow_run_id"] === event.flowRunId && (!existing["event_hash"] || existing["event_hash"] === event.inputHash)) {
+          return false;
+        }
         throw new ConflictError("Flow event id was reused with different content", { eventId: event.id, flowRunId: event.flowRunId });
       }
+      if (event.callbackSequence !== undefined) {
+        const sequenceOwner = this.db.prepare(
+          "SELECT id FROM flow_events WHERE flow_run_id = ? AND callback_sequence = ?",
+        ).get(event.flowRunId, event.callbackSequence) as Record<string, unknown> | undefined;
+        if (sequenceOwner) {
+          throw new ConflictError("Flow callback sequence was reused by a different event", {
+            flowRunId: event.flowRunId,
+            sequence: event.callbackSequence,
+            eventId: event.id,
+            existingEventId: String(sequenceOwner["id"]),
+          });
+        }
+      }
+      throw new ConflictError("Flow event could not be inserted because its identity conflicts", {
+        eventId: event.id,
+        flowRunId: event.flowRunId,
+      });
     }
     return result.changes === 1;
   }
