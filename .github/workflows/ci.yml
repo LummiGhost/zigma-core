@@ -49,3 +49,34 @@ jobs:
         env:
           ZIGMA_FLOW_REPO: ${{ github.workspace }}/.providers/zigma-flow
           ZIGMA_WORKSPACE_REPO: ${{ github.workspace }}/.providers/zigma-workspace
+
+  m3-cross-repo-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+      - run: npm ci
+      # M3.5 provider pins: Flow managed workspace bridge (PR #319) and
+      # Workspace managed-role negotiation + consumer harness (PR #43).
+      # Same reproducibility rationale as the m0 gate.
+      - uses: actions/checkout@v4
+        with:
+          repository: LummiGhost/zigma-flow
+          ref: 51c3f6f4f5b40d3a5373fe5ad48fadc0c8662e3c
+          path: .providers/zigma-flow
+      - run: pnpm install --frozen-lockfile
+        working-directory: .providers/zigma-flow
+      - uses: actions/checkout@v4
+        with:
+          repository: LummiGhost/zigma-workspace
+          ref: 76c069ccb154b1ee1a733d44a6a695faff35a17a
+          path: .providers/zigma-workspace
+      - run: npm ci
+        working-directory: .providers/zigma-workspace
+      - run: npm run test:m3-cross-repo
+        env:
+          ZIGMA_FLOW_REPO: ${{ github.workspace }}/.providers/zigma-flow
+          ZIGMA_WORKSPACE_REPO: ${{ github.workspace }}/.providers/zigma-workspace
