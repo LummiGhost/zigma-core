@@ -80,8 +80,34 @@ metadata：每个 artifact 必须有 `file:` URI、lowercase `sha256:<64 hex>` d
 可读本地 bytes，Core 重算 digest 后才登记 evidence。未知 handshake version 或
 篡改的 artifact bytes 都在后续 side effect/evidence 写入前 fail closed。
 
-Heartbeat、reconcile、integration lock 和 strict cleanup 在 M3 暴露 stable CLI
-前不能作为 Core 跨进程依赖。
+自 M3.5 起，reconcile 与 strict cleanup 已是 stable CLI（`reconcile --workspace`、
+`cleanup --workspace --operation-id --strict`），Core 的 M3 生命周期证据测试直接
+跨进程使用它们（见下方 managed bridge 小节）；heartbeat 与 integration lock 仍
+只在 workspace 内部使用，不作为 Core 依赖。
+
+### Managed workspace bridge (M3.5)
+
+zigma-flow 在 `ZIGMA_WORKSPACE_CLI_PATH` 指向 workspace CLI 构建产物时激活
+managed bridge：provider 必须通过 `contract-info` 自报 `contract_version === 1`、
+`provider === "zigma-workspace"` 且 `managed_supported === true`，缺失或为 `false`
+一律 fail closed，绝不静默回退到 external-directory 执行。Flow 侧不硬编码任何
+capability 列表；workspace 的 `negotiate --role managed` 提供同语义的单次校验。
+
+Core 通过 provider profile 的 `environment` 注入以下变量（经
+`core-service.ts` → `LocalCliFlowExecutor` 的环境透传）：
+
+- `ZIGMA_WORKSPACE_CLI_PATH` — 已构建 workspace CLI（`dist/cli/index.js`）的
+  绝对路径；未设置时 managed workflow 在 Flow Engine 端口按既有
+  ValidationError fail closed；
+- `ZIGMA_WORKSPACE_STATE_DIR` — 可选；透传为每次 CLI spawn 的全局
+  `--state-dir`，把 registry/journal/锁收敛到 Core 可见的位置。
+
+Bridge 目前只实现 `prepare-run`/`prepare-job`；run 取消或崩溃后，job attempt
+与 run workspace 会留在 workspace registry 中（status RUNNING）。Core 的 M3
+生命周期证据测试证明宿主可以对此恢复：abort 到 quiescence 后，用 workspace
+CLI 逐个 `reconcile` 并按 job→run 顺序 `cleanup --strict`，registry 收敛为
+CLEANED。验收证据由 `npm run test:m3-cross-repo` 提供（跨仓库兼容矩阵见
+zigma-workspace `docs/compatibility-matrix.md`）。
 
 ## 4. 共同规则
 

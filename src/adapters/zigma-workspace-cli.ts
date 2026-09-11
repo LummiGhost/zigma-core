@@ -71,7 +71,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 const WORKSPACE_CONTRACT_VERSION = 1;
 const WORKSPACE_PROVIDER = "zigma-workspace";
-const REQUIRED_WORKSPACE_CAPABILITIES = [
+/** Core's M0 role requirements — deliberately narrower than the provider's managed lifecycle role. */
+export const REQUIRED_WORKSPACE_CAPABILITIES = [
   "workspace-create-v1",
   "workspace-bind-run-v1",
   "workspace-diff-artifact-v1",
@@ -139,7 +140,8 @@ function parseEnvelope<T>(output: string, processExitCode: number, operation: st
   return envelope.data;
 }
 
-function validateContractInfo(info: WorkspaceContractInfo): WorkspaceContractInfo {
+/** Exported for the M3 cross-repo negotiation-agreement contract test. */
+export function validateContractInfo(info: WorkspaceContractInfo): WorkspaceContractInfo {
   if (info.contract_version !== WORKSPACE_CONTRACT_VERSION) {
     throw new IntegrationError(
       `zigma-workspace advertised contract version mismatch: expected ${WORKSPACE_CONTRACT_VERSION}, got ${String(info.contract_version)}`,
