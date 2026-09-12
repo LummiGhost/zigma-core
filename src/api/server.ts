@@ -76,6 +76,10 @@ export function buildServer(core: CoreService): FastifyInstance {
     data: core.recordFlowEvent(request.params.id, request.body as never)
   }));
 
+  app.get<{ Params: { id: string } }>("/v1/flow-runs/:id/metrics", async (request) => ({
+    data: core.getFlowRunMetrics(request.params.id)
+  }));
+
   app.post("/v1/human-gates", async (request, reply) => {
     const gate = core.createHumanGate(request.body as never);
     return reply.status(201).send({ data: gate });

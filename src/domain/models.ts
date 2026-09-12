@@ -8,6 +8,7 @@ import type {
   TaskSource,
   WorkspacePolicy
 } from "../contracts/schemas.js";
+import type { ExecutionMetricsSnapshot } from "./execution-metrics.js";
 
 export type ProjectStatus = "active" | "archived";
 export type TaskStatus =
@@ -171,6 +172,8 @@ export interface FlowRun {
   createdAt: string;
   updatedAt: string;
   completedAt?: string;
+  /** Persisted execution-metrics snapshot; written at terminal and reconciliation boundaries. */
+  metrics?: ExecutionMetricsSnapshot;
 }
 
 export interface ExecutionCommand {

@@ -45,6 +45,7 @@ import type {
   WorkspaceRef
 } from "../domain/models.js";
 import { ConflictError, ForbiddenError, IntegrationError, NotFoundError } from "../domain/errors.js";
+import { ExecutionMetricsRegistry, type ExecutionMetricsSnapshot } from "../domain/execution-metrics.js";
 import {
   assertEvidenceBundleTransition,
   assertFlowTransition,
@@ -78,6 +79,8 @@ export interface CoreServiceDependencies {
   clock: Clock;
   ids: IdGenerator;
   executionMode?: "synchronous" | "asynchronous";
+  /** Shared registry; the async runtime must receive the same instance for attribution to persist. */
+  metrics?: ExecutionMetricsRegistry;
 }
 
 export interface TaskView {
@@ -131,6 +134,8 @@ export class CoreService {
   private readonly clock: Clock;
   private readonly ids: IdGenerator;
   private readonly executionMode: "synchronous" | "asynchronous";
+  /** Shared with the async runtime so runtime-attributed counters persist on the same run rows. */
+  readonly metricsRegistry: ExecutionMetricsRegistry;
 
   constructor(dependencies: CoreServiceDependencies) {
     this.store = dependencies.store;
@@ -139,6 +144,15 @@ export class CoreService {
     this.clock = dependencies.clock;
     this.ids = dependencies.ids;
     this.executionMode = dependencies.executionMode ?? "synchronous";
+    this.metricsRegistry = dependencies.metrics ?? new ExecutionMetricsRegistry((flowRunId) => {
+      try {
+        return this.store.getFlowRun(flowRunId).metrics;
+      } catch (error) {
+        // A run that has not been inserted yet simply has no partial snapshot.
+        if (error instanceof NotFoundError) return undefined;
+        throw error;
+      }
+    });
   }
 
   createExecutionProfile(raw: CreateExecutionProfileInput): ExecutionProfile {
@@ -481,6 +495,13 @@ export class CoreService {
       assertFlowTransition(runBeforeStart.status, "starting");
       this.store.updateFlowRun({ ...runBeforeStart, status: "starting", startedAt: startTime, updatedAt: startTime });
       task = this.transitionTask(this.store.getTask(task.id), "running", input.callerContext.actor);
+      this.metricsRegistry.record(flowRun.id, (metrics) => metrics.increment("started"));
+      // Synchronous mode dispatches straight from the queue without a lease
+      // boundary; queue_to_dispatch measures queue insertion to provider call.
+      this.metricsRegistry.record(flowRun.id, (metrics) => {
+        metrics.increment("dispatched");
+        metrics.recordDuration("queue_to_dispatch", Math.max(0, Date.parse(startTime) - Date.parse(executionCommand.createdAt)));
+      });
 
       const projectRoot = workspace?.path ?? String(project.metadata["projectRoot"] ?? process.cwd());
       const result = await this.flowExecutor.start({
@@ -531,7 +552,7 @@ export class CoreService {
       if (!["completed", "failed", "cancelled"].includes(currentRun.status)) {
         const failureAt = this.clock.now();
         const failedRun: FlowRun = {
-          ...currentRun,
+          ...this.terminalMetrics(flowRun.id, "failed", currentRun, failureAt),
           status: "failed",
           error: { code: "START_FAILED", message, details: {} },
           updatedAt: failureAt,
@@ -638,6 +659,10 @@ export class CoreService {
         );
         return this.getTaskView(task.id);
       }
+      this.metricsRegistry.record(command.flowRunId, (metrics) => {
+        metrics.increment("dispatched");
+        metrics.recordDuration("queue_to_dispatch", Math.max(0, Date.parse(dispatchStartedAt) - Date.parse(command.createdAt)));
+      });
       await options.onPhase?.("provider-dispatch-started");
       if (this.store.getExecutionCommand(command.id).status === "cancel_requested") {
         this.markReconciliationRequired(
@@ -707,6 +732,10 @@ export class CoreService {
         if (runBeforeStart.status === "created") {
           assertFlowTransition(runBeforeStart.status, "starting");
           this.store.updateFlowRun({ ...runBeforeStart, status: "starting", startedAt, updatedAt: startedAt });
+          this.metricsRegistry.record(run.id, (metrics) => {
+            metrics.increment("started");
+            metrics.recordDuration("dispatch_to_start", Math.max(0, Date.parse(startedAt) - Date.parse(dispatchStartedAt)));
+          });
         }
         const taskBeforeInvoke = this.store.getTask(task.id);
         if (taskBeforeInvoke.status === "provisioning") this.transitionTask(taskBeforeInvoke, "running", payload.callerContext.actor);
@@ -800,7 +829,13 @@ export class CoreService {
             return;
           }
           if (!["completed", "failed", "cancelled"].includes(currentRun.status)) {
-            this.store.updateFlowRun({ ...currentRun, status: "failed", error: { code: "DISPATCH_FAILED", message, details: {} }, updatedAt: failedAt, completedAt: failedAt });
+            this.store.updateFlowRun({
+              ...this.terminalMetrics(run.id, "failed", currentRun, failedAt),
+              status: "failed",
+              error: { code: "DISPATCH_FAILED", message, details: {} },
+              updatedAt: failedAt,
+              completedAt: failedAt
+            });
             const refreshedTask = this.store.getTask(task.id);
             if (!["completed", "failed", "cancelled"].includes(refreshedTask.status)) this.transitionTask(refreshedTask, "failed", SYSTEM_ACTOR, { code: "DISPATCH_FAILED", message, details: {} });
           }
@@ -908,8 +943,14 @@ export class CoreService {
         ...(result.summary !== undefined ? { summary: result.summary } : {}),
         metadata: { ...result.metadata, reconciled: true }
       };
-      this.applyFlowResultState(currentRun.id, reconciledResult, SYSTEM_ACTOR);
       const terminal = ["completed", "failed", "cancelled"].includes(result.status);
+      if (terminal) {
+        // A terminal result reconstructed from provider truth means an
+        // interrupted dispatch was recovered by reconciliation. Record before
+        // applyFlowResultState so the terminal snapshot includes it.
+        this.metricsRegistry.record(command.flowRunId, (metrics) => metrics.increment("reconcile_restarts"));
+      }
+      this.applyFlowResultState(currentRun.id, reconciledResult, SYSTEM_ACTOR);
       this.store.updateExecutionCommand({
         ...currentCommand,
         status: terminal
@@ -1014,7 +1055,15 @@ export class CoreService {
     this.store.cancelOutboxDeliveryForCommand(command.id, now);
     if (!["completed", "failed", "cancelled"].includes(run.status)) {
       assertFlowTransition(run.status, "cancelled");
-      this.store.updateFlowRun({ ...run, status: "cancelled", updatedAt: now, completedAt: now });
+      this.metricsRegistry.record(command.flowRunId, (metrics) => {
+        metrics.recordDuration("quiescence", Math.max(0, Date.parse(now) - Date.parse(command.cancelRequestedAt ?? now)));
+      });
+      this.store.updateFlowRun({
+        ...this.terminalMetrics(command.flowRunId, "cancelled", run, now),
+        status: "cancelled",
+        updatedAt: now,
+        completedAt: now
+      });
     }
     if (!["completed", "failed", "cancelled"].includes(task.status)) {
       this.transitionTask(task, "cancelled", actor, undefined, { reason, quiescent: true, providerDispatched: false });
@@ -1075,6 +1124,9 @@ export class CoreService {
     this.store.fencedTransaction(fence, acknowledgedAt, () => {
       const current = this.store.getExecutionCommand(command.id);
       if (["completed", "failed", "cancelled"].includes(current.status)) return;
+      this.metricsRegistry.record(command.flowRunId, (metrics) => {
+        metrics.recordDuration("quiescence", Math.max(0, Date.parse(acknowledgedAt) - Date.parse(current.cancelRequestedAt ?? acknowledgedAt)));
+      });
       this.applyFlowResultState(command.flowRunId, result, actor);
       this.store.updateExecutionCommand({
         ...current,
@@ -1211,6 +1263,11 @@ export class CoreService {
     });
     if (!inserted) return this.getTaskView(currentRun.taskId);
 
+    const failureKind = input.payload["failure_kind"];
+    if (failureKind === "workspace_merge_conflict" || failureKind === "workspace_integration_failed") {
+      this.metricsRegistry.record(flowRunId, (metrics) => metrics.increment("workspace_conflicts"));
+    }
+
     if (input.callbackVersion === 1) {
       currentRun = {
         ...currentRun,
@@ -1227,14 +1284,19 @@ export class CoreService {
     const targetIsTerminal = targetStatus ? ["completed", "failed", "cancelled"].includes(targetStatus) : false;
     if (targetStatus && !(runIsTerminal && !targetIsTerminal)) {
       assertFlowTransition(currentRun.status, targetStatus);
-      const terminal = ["completed", "failed", "cancelled"].includes(targetStatus);
+      const terminalStatus = targetStatus === "completed" || targetStatus === "failed" || targetStatus === "cancelled"
+        ? targetStatus
+        : undefined;
+      if (targetStatus === "awaiting_human" && currentRun.status !== "awaiting_human") {
+        this.metricsRegistry.record(flowRunId, (metrics) => metrics.increment("awaiting_human"));
+      }
       this.store.updateFlowRun({
-        ...currentRun,
+        ...(terminalStatus ? this.terminalMetrics(flowRunId, terminalStatus, currentRun, updatedAt) : currentRun),
         status: targetStatus,
         ...(input.externalRunId !== undefined ? { externalRunId: input.externalRunId } : {}),
         ...(input.error !== undefined ? { error: input.error } : {}),
         updatedAt,
-        ...(terminal ? { completedAt: updatedAt } : {})
+        ...(terminalStatus ? { completedAt: updatedAt } : {})
       });
       this.syncTaskToFlowStatus(currentRun.taskId, targetStatus, actor, input.error);
     } else if (input.callbackVersion === 1) {
@@ -1298,6 +1360,7 @@ export class CoreService {
       if (run.status !== "awaiting_human") {
         assertFlowTransition(run.status, "awaiting_human");
         this.store.updateFlowRun({ ...run, status: "awaiting_human", updatedAt: now });
+        this.metricsRegistry.record(input.flowRunId, (metrics) => metrics.increment("awaiting_human"));
       }
       const task = this.store.getTask(input.taskId);
       if (task.status !== "awaiting_human") {
@@ -1539,6 +1602,7 @@ export class CoreService {
     if (["completed", "failed", "cancelled"].includes(task.status)) {
       throw new ConflictError("Task is already terminal", { taskId, status: task.status });
     }
+    const requestedAt = this.clock.now();
     if (task.activeFlowRunId) {
       const run = this.store.getFlowRun(task.activeFlowRunId);
       const command = this.store.getExecutionCommandForRun(run.id);
@@ -1567,6 +1631,9 @@ export class CoreService {
         }
         const now = this.clock.now();
         this.store.transaction(() => {
+          this.metricsRegistry.record(run.id, (metrics) => {
+            metrics.recordDuration("quiescence", Math.max(0, Date.parse(now) - Date.parse(requestedAt)));
+          });
           this.applyFlowResultState(run.id, result, actor);
           if (command && !["completed", "failed", "cancelled"].includes(command.status)) {
             this.store.updateExecutionCommand({
@@ -1592,7 +1659,15 @@ export class CoreService {
       if (!["completed", "failed", "cancelled"].includes(run.status)) {
         const now = this.clock.now();
         assertFlowTransition(run.status, "cancelled");
-        this.store.updateFlowRun({ ...run, status: "cancelled", updatedAt: now, completedAt: now });
+        this.metricsRegistry.record(run.id, (metrics) => {
+          metrics.recordDuration("quiescence", Math.max(0, Date.parse(now) - Date.parse(requestedAt)));
+        });
+        this.store.updateFlowRun({
+          ...this.terminalMetrics(run.id, "cancelled", run, now),
+          status: "cancelled",
+          updatedAt: now,
+          completedAt: now
+        });
         if (command && !["completed", "failed", "cancelled"].includes(command.status)) {
           this.store.updateExecutionCommand({ ...command, status: "cancelled", updatedAt: now, completedAt: now });
         }
@@ -1603,6 +1678,33 @@ export class CoreService {
 
   listTaskAudit(taskId: string): AuditEvent[] {
     return this.store.listAuditEvents("task", taskId);
+  }
+
+  /** Live accumulator when this process has touched the run; otherwise the persisted snapshot. */
+  getFlowRunMetrics(flowRunId: string): ExecutionMetricsSnapshot | null {
+    return this.metricsRegistry.snapshot(flowRunId, this.clock.now())
+      ?? this.store.getFlowRun(flowRunId).metrics
+      ?? null;
+  }
+
+  /**
+   * Counts a terminal transition and returns the run row with the refreshed
+   * metrics snapshot attached for persistence in the same update. Replayed
+   * terminal transitions keep the previously persisted snapshot.
+   */
+  private terminalMetrics(
+    flowRunId: string,
+    status: "completed" | "failed" | "cancelled",
+    run: FlowRun,
+    now: string
+  ): FlowRun {
+    if (["completed", "failed", "cancelled"].includes(run.status)) return run;
+    const startMs = Date.parse(run.startedAt ?? run.createdAt);
+    const metrics = this.metricsRegistry.record(flowRunId, (accumulator) => {
+      accumulator.increment(status);
+      accumulator.recordDuration("start_to_terminal", Math.max(0, Date.parse(now) - startMs));
+    }, now);
+    return metrics ? { ...run, metrics } : run;
   }
 
   private applyFlowResult(
@@ -1622,15 +1724,17 @@ export class CoreService {
     const run = this.store.getFlowRun(flowRunId);
     if (run.status !== result.status) assertFlowTransition(run.status, result.status);
     const now = this.clock.now();
-    const terminal = ["completed", "failed", "cancelled"].includes(result.status);
+    const terminalStatus = result.status === "completed" || result.status === "failed" || result.status === "cancelled"
+      ? result.status
+      : undefined;
     const updated: FlowRun = {
-      ...run,
+      ...(terminalStatus ? this.terminalMetrics(flowRunId, terminalStatus, run, now) : run),
       externalRunId: result.externalRunId,
       status: result.status,
       exitCode: result.exitCode,
       context: { ...run.context, executor: result.metadata, summary: result.summary },
       updatedAt: now,
-      ...(terminal ? { completedAt: now } : {})
+      ...(terminalStatus ? { completedAt: now } : {})
     };
     this.store.updateFlowRun(updated);
     this.syncTaskToFlowStatus(run.taskId, result.status, actor);

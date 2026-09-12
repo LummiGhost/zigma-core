@@ -5,6 +5,7 @@ import {
   type ActorRef
 } from "../contracts/schemas.js";
 import type { ExecutionLeaseFence } from "../contracts/ports.js";
+import type { ExecutionMetricsSnapshot } from "../domain/execution-metrics.js";
 import type {
   AuditEvent,
   EvidenceBundle,
@@ -149,7 +150,8 @@ export class SqliteStore {
         started_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        completed_at TEXT
+        completed_at TEXT,
+        metrics_json TEXT
       );
 
       CREATE TABLE IF NOT EXISTS execution_commands (
@@ -394,6 +396,9 @@ export class SqliteStore {
     if (!flowRunColumns.some((column) => column.name === "last_callback_sequence")) {
       this.db.exec("ALTER TABLE flow_runs ADD COLUMN last_callback_sequence INTEGER NOT NULL DEFAULT 0");
     }
+    if (!flowRunColumns.some((column) => column.name === "metrics_json")) {
+      this.db.exec("ALTER TABLE flow_runs ADD COLUMN metrics_json TEXT");
+    }
     const commandColumns = this.db.prepare("PRAGMA table_info(execution_commands)").all() as Array<{ name: string }>;
     if (!commandColumns.some((column) => column.name === "provider_response_json")) {
       this.db.exec("ALTER TABLE execution_commands ADD COLUMN provider_response_json TEXT");
@@ -627,8 +632,8 @@ export class SqliteStore {
     this.db.prepare(`INSERT INTO flow_runs (
       id, task_id, workflow_ref, execution_profile_id, permission_snapshot_id,
       workspace_id, external_run_id, status, attempt, last_callback_sequence, inputs_json, context_json,
-      exit_code, error_json, started_at, created_at, updated_at, completed_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      exit_code, error_json, started_at, created_at, updated_at, completed_at, metrics_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       run.id,
       run.taskId,
       run.workflowRef,
@@ -646,7 +651,8 @@ export class SqliteStore {
       run.startedAt ?? null,
       run.createdAt,
       run.updatedAt,
-      run.completedAt ?? null
+      run.completedAt ?? null,
+      run.metrics ? toJson(run.metrics) : null
     );
   }
 
@@ -1143,14 +1149,15 @@ export class SqliteStore {
       ...(optionalString(row["started_at"]) ? { startedAt: optionalString(row["started_at"]) } : {}),
       createdAt: String(row["created_at"]),
       updatedAt: String(row["updated_at"]),
-      ...(optionalString(row["completed_at"]) ? { completedAt: optionalString(row["completed_at"]) } : {})
+      ...(optionalString(row["completed_at"]) ? { completedAt: optionalString(row["completed_at"]) } : {}),
+      ...(optionalString(row["metrics_json"]) ? { metrics: fromJson<ExecutionMetricsSnapshot | undefined>(row["metrics_json"], undefined) } : {})
     };
   }
 
   updateFlowRun(run: FlowRun): void {
     this.db.prepare(`UPDATE flow_runs SET
       workspace_id = ?, external_run_id = ?, status = ?, last_callback_sequence = ?, context_json = ?,
-      exit_code = ?, error_json = ?, started_at = ?, updated_at = ?, completed_at = ?
+      exit_code = ?, error_json = ?, started_at = ?, updated_at = ?, completed_at = ?, metrics_json = ?
       WHERE id = ?`).run(
         run.workspaceId ?? null,
         run.externalRunId ?? null,
@@ -1162,6 +1169,7 @@ export class SqliteStore {
         run.startedAt ?? null,
         run.updatedAt,
         run.completedAt ?? null,
+        run.metrics ? toJson(run.metrics) : null,
         run.id
       );
   }

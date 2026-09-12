@@ -59,6 +59,7 @@ async function main(): Promise<void> {
       const runtime = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
         ownerId: `core-${process.pid}`,
         workerConcurrency,
+        metrics: core.metricsRegistry,
         policyFor(commandId) {
           const command = store.getExecutionCommand(commandId);
           const project = store.getProject(command.projectId);
@@ -147,6 +148,18 @@ async function main(): Promise<void> {
       const { core, store } = await openCore(program.opts<{ db: string }>().db);
       try {
         print({ data: await core.cancelTask(id, options.reason) });
+      } finally {
+        store.close();
+      }
+    });
+
+  program
+    .command("metrics <flowRunId>")
+    .description("Show execution metrics for a flow run")
+    .action(async (flowRunId: string) => {
+      const { core, store } = await openCore(program.opts<{ db: string }>().db);
+      try {
+        print({ data: core.getFlowRunMetrics(flowRunId) });
       } finally {
         store.close();
       }
