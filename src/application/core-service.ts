@@ -881,6 +881,7 @@ export class CoreService {
     const run = this.store.getFlowRun(command.flowRunId);
     const profile = this.store.getExecutionProfile(run.executionProfileId);
     const workspace = run.workspaceId ? this.store.getWorkspace(run.workspaceId) : undefined;
+    const project = this.store.getProject(command.projectId);
     if (!this.flowExecutor.reconcile) {
       this.markReconciliationRequired(
         command.id,
@@ -896,7 +897,7 @@ export class CoreService {
       executionFence: fence,
       ...(run.externalRunId ? { externalRunId: run.externalRunId } : {}),
       command: profile.flowCommand,
-      projectRoot: workspace?.path ?? process.cwd(),
+      projectRoot: workspace?.path ?? String(project.metadata["projectRoot"] ?? process.cwd()),
       timeoutMs: profile.timeoutMs,
       environment: profile.environment
     });
@@ -951,6 +952,16 @@ export class CoreService {
         this.metricsRegistry.record(command.flowRunId, (metrics) => metrics.increment("reconcile_restarts"));
       }
       this.applyFlowResultState(currentRun.id, reconciledResult, SYSTEM_ACTOR);
+      if (terminal && ["completed", "failed", "cancelled"].includes(currentRun.status)) {
+        // applyFlowResultState keeps the previously persisted snapshot when a
+        // callback already made the run terminal; refresh it so the
+        // reconstruction counter survives the next restart.
+        this.store.updateFlowRun({
+          ...currentRun,
+          metrics: this.metricsRegistry.snapshot(command.flowRunId, reconciledAt) ?? currentRun.metrics,
+          updatedAt: reconciledAt
+        });
+      }
       this.store.updateExecutionCommand({
         ...currentCommand,
         status: terminal
@@ -1094,6 +1105,7 @@ export class CoreService {
     }
     const profile = this.store.getExecutionProfile(run.executionProfileId);
     const workspace = run.workspaceId ? this.store.getWorkspace(run.workspaceId) : undefined;
+    const project = this.store.getProject(command.projectId);
     this.assertMutatingProviderFence(fence);
     let result: Awaited<ReturnType<NonNullable<FlowExecutor["cancel"]>>>;
     try {
@@ -1102,7 +1114,7 @@ export class CoreService {
         executionFence: fence,
         command: profile.flowCommand,
         externalRunId: run.externalRunId,
-        projectRoot: workspace?.path ?? process.cwd(),
+        projectRoot: workspace?.path ?? String(project.metadata["projectRoot"] ?? process.cwd()),
         reason,
         timeoutMs: profile.timeoutMs,
         environment: profile.environment
@@ -1265,7 +1277,20 @@ export class CoreService {
 
     const failureKind = input.payload["failure_kind"];
     if (failureKind === "workspace_merge_conflict" || failureKind === "workspace_integration_failed") {
-      this.metricsRegistry.record(flowRunId, (metrics) => metrics.increment("workspace_conflicts"));
+      const jobId = typeof input.payload["job_id"] === "string" ? input.payload["job_id"] : "";
+      const attempt = typeof input.payload["attempt"] === "number" ? input.payload["attempt"] : 0;
+      const alreadyCounted =
+        jobId !== "" &&
+        this.store.hasFlowEventWithFailureKind({
+          flowRunId,
+          failureKind,
+          jobId,
+          attempt,
+          excludeEventId: input.eventId,
+        });
+      if (!alreadyCounted) {
+        this.metricsRegistry.record(flowRunId, (metrics) => metrics.increment("workspace_conflicts"));
+      }
     }
 
     if (input.callbackVersion === 1) {
@@ -1435,6 +1460,7 @@ export class CoreService {
       return this.failHumanGateDelivery(gate, decision, "Flow run has no externalRunId");
     }
     const workspace = run.workspaceId ? this.store.getWorkspace(run.workspaceId) : undefined;
+    const project = this.store.getProject(this.store.getTask(gate.taskId).projectId);
     try {
       if (!this.flowExecutor.decideGate) {
         throw new Error("Flow executor does not support human gate decisions");
@@ -1447,7 +1473,7 @@ export class CoreService {
         decision: input.decision,
         ...(input.comment !== undefined ? { comment: input.comment } : {}),
         input: input.input,
-        projectRoot: workspace?.path ?? process.cwd(),
+        projectRoot: workspace?.path ?? String(project.metadata["projectRoot"] ?? process.cwd()),
         timeoutMs: profile.timeoutMs,
         environment: profile.environment
       });
@@ -1613,11 +1639,12 @@ export class CoreService {
       if (run.externalRunId && this.flowExecutor.cancel) {
         const workspace = run.workspaceId ? this.store.getWorkspace(run.workspaceId) : undefined;
         const profile = this.store.getExecutionProfile(run.executionProfileId);
+        const project = this.store.getProject(task.projectId);
         const result = await this.flowExecutor.cancel({
           ...(command ? { operationId: command.operationId } : {}),
           command: profile.flowCommand,
           externalRunId: run.externalRunId,
-          projectRoot: workspace?.path ?? process.cwd(),
+          projectRoot: workspace?.path ?? String(project.metadata["projectRoot"] ?? process.cwd()),
           reason,
           timeoutMs: profile.timeoutMs,
           environment: profile.environment
@@ -1768,7 +1795,15 @@ export class CoreService {
       cancelled: "cancelled"
     }[status] as TaskStatus | undefined;
     if (!target || task.status === target) return;
-    this.transitionTask(task, target, actor, error);
+    // A task blocked for reconciliation carries the provider's authority: the
+    // block marks an interrupted Core window, not a rejected outcome, so the
+    // provider's terminal evidence (callback or sweep inspection) must be
+    // accepted instead of failing the transition.
+    const reconciliationTerminal = task.status === "blocked"
+      && ["completed", "failed", "cancelled"].includes(target)
+      && task.activeFlowRunId !== undefined
+      && this.store.getExecutionCommandForRun(task.activeFlowRunId)?.status === "reconciling";
+    this.transitionTask(task, target, actor, error, undefined, reconciliationTerminal);
   }
 
   private transitionTask(
@@ -1776,9 +1811,12 @@ export class CoreService {
     status: TaskStatus,
     actor: { type: "user" | "agent" | "service" | "system"; id: string; displayName?: string; provider?: string; externalId?: string },
     failure?: { code: string; message: string; details: Record<string, unknown> },
-    payload: Record<string, unknown> = {}
+    payload: Record<string, unknown> = {},
+    allowBlockedTerminal = false
   ): Task {
-    assertTaskTransition(task.status, status);
+    if (!(allowBlockedTerminal && task.status === "blocked" && ["completed", "failed", "cancelled"].includes(status))) {
+      assertTaskTransition(task.status, status);
+    }
     const now = this.clock.now();
     const terminal = ["completed", "failed", "cancelled"].includes(status);
     const updated: Task = {

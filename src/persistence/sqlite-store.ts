@@ -1277,6 +1277,24 @@ export class SqliteStore {
     return row ? { flowRunId: String(row["flow_run_id"]), ...(optionalString(row["event_hash"]) ? { inputHash: optionalString(row["event_hash"]) } : {}) } : undefined;
   }
 
+  /**
+   * True when an earlier event of the same run already carries the given
+   * failure kind for the same job+attempt. Used to count one workspace
+   * conflict per incident: Flow emits the kind on both the attempt_failed
+   * and job_failed events of a single conflict.
+   */
+  hasFlowEventWithFailureKind(input: { flowRunId: string; failureKind: string; jobId: string; attempt: number; excludeEventId: string }): boolean {
+    const row = this.db.prepare(
+      `SELECT 1 FROM flow_events
+       WHERE flow_run_id = ? AND id <> ?
+         AND json_extract(payload_json, '$.failure_kind') = ?
+         AND json_extract(payload_json, '$.job_id') = ?
+         AND json_extract(payload_json, '$.attempt') = ?
+       LIMIT 1`,
+    ).get(input.flowRunId, input.excludeEventId, input.failureKind, input.jobId, input.attempt);
+    return row !== undefined;
+  }
+
   upsertProviderWorkspaceHandle(handle: ProviderWorkspaceHandle): ProviderWorkspaceHandle {
     const existing = this.db.prepare("SELECT * FROM provider_workspace_handles WHERE provider = ? AND external_id = ?").get(handle.provider, handle.externalId) as Record<string, unknown> | undefined;
     if (existing && (

@@ -54,6 +54,21 @@ rejects unknown provider versions and workspace artifact bytes whose `sha256`
 does not match the emitted `file:` URI. CI checks out the public handshake
 commits before running this same command.
 
+The M4 gate runs the full managed lifecycle against real Core/Flow/Workspace
+processes:
+
+```bash
+$env:ZIGMA_FLOW_REPO = 'D:\zigma\zigma-flow'
+$env:ZIGMA_WORKSPACE_REPO = 'D:\zigma\zigma-workspace'
+npm run test:m4-cross-repo
+```
+
+It covers parallel dispatch with per-run execution metrics, external-commit
+merge-conflict rollback, cancel + abort quiescence with per-result retention,
+restart recovery in two crash windows, worker-kill fail-safe, and
+single-writable admission invariants. Evidence and the pinned provider commits
+are recorded in `docs/m4-results.md`.
+
 ## Run the API
 
 ```bash

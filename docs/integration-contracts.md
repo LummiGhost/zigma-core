@@ -102,12 +102,23 @@ Core 通过 provider profile 的 `environment` 注入以下变量（经
 - `ZIGMA_WORKSPACE_STATE_DIR` — 可选；透传为每次 CLI spawn 的全局
   `--state-dir`，把 registry/journal/锁收敛到 Core 可见的位置。
 
-Bridge 目前只实现 `prepare-run`/`prepare-job`；run 取消或崩溃后，job attempt
-与 run workspace 会留在 workspace registry 中（status RUNNING）。Core 的 M3
-生命周期证据测试证明宿主可以对此恢复：abort 到 quiescence 后，用 workspace
-CLI 逐个 `reconcile` 并按 job→run 顺序 `cleanup --strict`，registry 收敛为
-CLEANED。验收证据由 `npm run test:m3-cross-repo` 提供（跨仓库兼容矩阵见
-zigma-workspace `docs/compatibility-matrix.md`）。
+Bridge 最初只实现 `prepare-run`/`prepare-job`；自 M4 起覆盖完整生命周期：
+`commit` / `integrate` / `publish` / `reconcile` / `cleanup`（operation-id
+命名空间 `run:<runId>[:job:<jobId>:attempt:<n>]`）。integrate 的
+`WORKSPACE_INTEGRATION_CONFLICT` 错误 envelope 被投影为类型化 `conflicted`
+结果（job 以 `workspace_merge_conflict` 失败、Run 保留、attempt 保留、不
+发布），cleanup 失败以 `cleanup_failed` 状态返回而不是抛出。清理遵循
+workspace 侧的 per-workspace retention（`success|failure|blocked`，缺省回落
+全局 `retainFailedDays`），job 级默认 success→cleanup。
+
+run 取消或崩溃后，未收敛的 job attempt 与 run workspace 会留在 workspace
+registry 中（status RUNNING）。Core 的 M3 生命周期证据测试证明宿主可以对此
+恢复：abort 到 quiescence 后，用 workspace CLI 逐个 `reconcile` 并按
+job→run 顺序 `cleanup --strict`，registry 收敛为 CLEANED。M4 证据测试
+（`npm run test:m4-cross-repo`）进一步覆盖并行完成、外部提交冲突、取消回滚、
+两个重启窗口、worker 被杀与 single-writable 不变量，证据记录见
+[`docs/m4-results.md`](m4-results.md)（跨仓库兼容矩阵见 zigma-workspace
+`docs/compatibility-matrix.md`）。
 
 ## 4. 共同规则
 

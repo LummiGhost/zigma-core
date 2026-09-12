@@ -1394,5 +1394,57 @@ describe("CoreService", () => {
       });
       expect(restarted.getFlowRunMetrics(run.id)).not.toBeNull();
     });
+
+    it("accepts provider terminal evidence for a task blocked pending reconciliation", async () => {
+      const clock = new ManualClock();
+      const { core, flow, store, project, task, ids } = setup({ executionMode: "asynchronous", clock });
+      const accepted = await core.startTask(task.id, { ...startInput(), idempotencyKey: "reconcile-blocked-terminal" });
+      const command = accepted.executionCommand!;
+      const run = accepted.activeFlowRun!;
+      const admission = new ExecutionAdmissionService(store, clock, ids);
+      const policy = store.getExecutionProfile(project.executionProfileId).executionPolicy;
+      const acquired = admission.admit(command.id, "worker-a", policy, 30_000);
+      expect(acquired.outcome).toBe("acquired");
+      if (acquired.outcome !== "acquired") throw new Error("expected lease");
+
+      flow.startError = new DispatchCrashpointError("provider-dispatch-started");
+      await expect(core.dispatchExecutionCommand(command.id, {
+        fence: executionFence(acquired.lease)
+      })).rejects.toBeInstanceOf(DispatchCrashpointError);
+
+      clock.advance(31_000);
+      const takeover = admission.takeoverForReconciliation(command.id, "worker-b", 60_000);
+      expect(takeover).toBeDefined();
+      flow.reconcile = async () => ({
+        outcome: "found", externalRunId: "zf-run-1", status: "completed", quiescent: false, metadata: {}
+      });
+      await core.reconcileExecutionCommand(command.id, executionFence(takeover!));
+      expect(store.getTask(task.id).status).toBe("blocked");
+      expect(store.getExecutionCommand(command.id).status).toBe("reconciling");
+
+      const terminalEvent = {
+        contractVersion: 1 as const, callbackVersion: 1 as const, producer: "zigma-flow" as const,
+        eventId: "terminal-after-block", flowRunId: run.id, operationId: command.operationId,
+        callbackCorrelationId: command.callbackCorrelationId, type: "run.completed" as const,
+        status: "completed" as const, externalRunId: "zf-run-1", sequence: 1,
+        occurredAt: "2026-07-20T04:00:00.000Z", payload: {}
+      };
+      const projected = core.recordFlowEvent(run.id, terminalEvent);
+      expect(projected.task.status).toBe("completed");
+      expect(projected.activeFlowRun?.status).toBe("completed");
+
+      clock.advance(61_000);
+      const secondTakeover = admission.takeoverForReconciliation(command.id, "worker-c", 60_000);
+      expect(secondTakeover).toBeDefined();
+      flow.reconcile = async () => ({
+        outcome: "found", externalRunId: "zf-run-1", status: "completed", quiescent: true, metadata: {}
+      });
+      await core.reconcileExecutionCommand(command.id, executionFence(secondTakeover!));
+      expect(store.getExecutionCommand(command.id).status).toBe("completed");
+      expect(store.getFlowRun(run.id).metrics?.counters).toMatchObject({
+        completed: 1,
+        reconcile_restarts: 1
+      });
+    });
   });
 });

@@ -44,6 +44,7 @@ interface FlowInvokeEnvelope {
   pausedGate?: unknown;
   artifacts?: unknown[];
   eventLogUri?: string;
+  error?: { message?: string };
 }
 
 interface FlowCommandEnvelope {
@@ -165,11 +166,15 @@ function parseInvokeJson(stdout: string, processExitCode: number): FlowStartResu
     );
   }
 
+  const errorDetail = typeof envelope.error?.message === "string" && envelope.error.message.trim() !== ""
+    ? `: ${envelope.error.message}`
+    : "";
+
   return {
     externalRunId: envelope.runId,
     status: envelope.status as FlowRunStatus,
     exitCode: envelope.exitCode ?? processExitCode,
-    summary: `zigma-flow run ${envelope.runId} finished with status ${envelope.status}`,
+    summary: `zigma-flow run ${envelope.runId} finished with status ${envelope.status}${errorDetail}`,
     metadata: {
       pausedGate: envelope.pausedGate ?? null,
       artifacts: envelope.artifacts ?? [],
@@ -390,7 +395,14 @@ export class LocalCliFlowExecutor implements FlowExecutor {
         env: { ...process.env, ...request.environment },
         timeout: request.timeoutMs,
         reject: false,
-        all: true
+        all: true,
+        // The Flow owner must outlive Core: modern libuv on Windows places
+        // non-detached children in a job object with KILL_ON_JOB_CLOSE, so a
+        // hard Core kill would otherwise take the in-flight Flow run with it
+        // (M4 restart-recovery window B). windowsHide keeps the detached
+        // console window invisible.
+        detached: true,
+        windowsHide: true
       });
       const stdout = result.stdout ?? result.all ?? "";
       if (request.dryRun) {
@@ -404,7 +416,14 @@ export class LocalCliFlowExecutor implements FlowExecutor {
       }
       const parsed = parseInvokeJson(stdout, result.exitCode ?? 1);
       if ((result.exitCode ?? 1) !== 0 && parsed.status !== "awaiting_human") {
-        return { ...parsed, status: "failed" };
+        const stderrTail = (result.stderr ?? "").trim().slice(-4_000);
+        return {
+          ...parsed,
+          status: "failed",
+          summary: stderrTail
+            ? `${parsed.summary}\n--- zigma-flow stderr ---\n${stderrTail}`
+            : parsed.summary
+        };
       }
       return parsed;
     } finally {
