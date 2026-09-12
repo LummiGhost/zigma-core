@@ -27,6 +27,7 @@
     "test": "vitest run",
     "test:m0-cross-repo": "node tests/run-m0-cross-repo-contracts.mjs",
     "test:m3-cross-repo": "node tests/run-m3-cross-repo-contracts.mjs",
+    "test:m4-cross-repo": "node tests/run-m4-cross-repo-contracts.mjs",
     "test:watch": "vitest",
     "check": "npm run typecheck && npm test && npm run build",
     "start": "node dist/cli.js"

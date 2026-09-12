@@ -17,7 +17,7 @@ import type {
 import { CoreService, DispatchCrashpointError, type DispatchExecutionPhase } from "../src/application/core-service.js";
 import { ExecutionAdmissionService, executionFence } from "../src/application/execution-admission.js";
 import { AsyncExecutionRuntime } from "../src/application/async-execution-runtime.js";
-import type { DecideHumanGateInput } from "../src/contracts/schemas.js";
+import type { DecideHumanGateInput, ExecutionPolicy } from "../src/contracts/schemas.js";
 import { SqliteStore } from "../src/persistence/sqlite-store.js";
 import { ConflictError, ForbiddenError } from "../src/domain/errors.js";
 
@@ -63,6 +63,8 @@ class FakeFlow implements FlowExecutor {
   readonly cancellations: FlowCancelRequest[] = [];
   starts = 0;
   startBarrier?: Promise<void>;
+  startError?: Error;
+  reconcile?: FlowExecutor["reconcile"];
 
   async preflight(): Promise<void> {}
   decisionError?: Error;
@@ -77,6 +79,7 @@ class FakeFlow implements FlowExecutor {
   async start(_request: FlowStartRequest): Promise<FlowStartResult> {
     this.starts += 1;
     await this.startBarrier;
+    if (this.startError) throw this.startError;
     return this.result;
   }
 
@@ -143,6 +146,7 @@ function setup(options?: {
   executionMode?: "synchronous" | "asynchronous";
   clock?: Clock;
   repositoryWritable?: boolean;
+  executionPolicy?: ExecutionPolicy;
   workspacePolicy?: {
     provider: "zigma-workspace-cli" | "existing-directory" | "none";
     mode: "writable" | "read-only";
@@ -170,6 +174,7 @@ function setup(options?: {
     flowCommand: "zigma-flow",
     workspaceCommand: "zigma-workspace",
     timeoutMs: 60_000,
+    ...(options?.executionPolicy !== undefined ? { executionPolicy: options.executionPolicy } : {}),
     environment: {},
     metadata: {}
   });
@@ -1121,5 +1126,325 @@ describe("CoreService", () => {
     expect(auditActions).toContain("evidence.collection_failed");
     expect(auditActions).toContain("task.completed");
     expect(auditActions).not.toContain("task.failed");
+  });
+
+  describe("execution metrics", () => {
+    it("persists terminal counters and durations on the flow run after a synchronous start", async () => {
+      const { core, store, task } = setup();
+      const view = await core.startTask(task.id, startInput());
+      const run = view.activeFlowRun!;
+
+      const metrics = store.getFlowRun(run.id).metrics!;
+      expect(metrics.counters).toMatchObject({ dispatched: 1, started: 1, completed: 1, failed: 0 });
+      expect(metrics.durations["queue_to_dispatch"].count).toBe(1);
+      expect(metrics.durations["start_to_terminal"].count).toBe(1);
+      expect(metrics.durations["dispatch_to_start"].count).toBe(0);
+      const live = core.getFlowRunMetrics(run.id)!;
+      expect(live.counters).toEqual(metrics.counters);
+      expect(live.durations).toEqual(metrics.durations);
+    });
+
+    it("counts async dispatch phases through the runtime and persists them at the terminal transition", async () => {
+      const { core, flow, store, project, task, clock, ids } = setup({ executionMode: "asynchronous" });
+      const accepted = await core.startTask(task.id, { ...startInput(), idempotencyKey: "metrics-async" });
+      const run = accepted.activeFlowRun!;
+      const runtime = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+        ownerId: "worker-metrics-async",
+        metrics: core.metricsRegistry,
+        policyFor: () => store.getExecutionProfile(project.executionProfileId).executionPolicy
+      });
+
+      expect(await runtime.runOnce()).toBe(1);
+      expect(flow.starts).toBe(1);
+
+      const metrics = store.getFlowRun(run.id).metrics!;
+      expect(metrics.counters).toMatchObject({ dispatched: 1, started: 1, completed: 1 });
+      expect(metrics.durations["queue_to_dispatch"].count).toBe(1);
+      expect(metrics.durations["dispatch_to_start"].count).toBe(1);
+      expect(metrics.durations["start_to_terminal"].count).toBe(1);
+    });
+
+    it("records workspace conflicts and human waits from flow events before the terminal snapshot", async () => {
+      const { core, flow, store, task } = setup();
+      flow.result = { externalRunId: "zf-run-1", status: "running", exitCode: 0, metadata: {} };
+      const started = await core.startTask(task.id, startInput());
+      const run = started.activeFlowRun!;
+      const command = started.executionCommand!;
+
+      core.recordFlowEvent(run.id, {
+        contractVersion: 1, callbackVersion: 1, producer: "zigma-flow",
+        eventId: "conflict-event", flowRunId: run.id, operationId: command.operationId,
+        callbackCorrelationId: command.callbackCorrelationId, externalRunId: "zf-run-1",
+        sequence: 1, type: "run.progress", occurredAt: "2026-07-20T02:00:00.000Z",
+        payload: { job_id: "impl", failure_kind: "workspace_merge_conflict", reason: "conflict in src/a.ts" }
+      });
+      core.recordFlowEvent(run.id, {
+        contractVersion: 1, callbackVersion: 1, producer: "zigma-flow",
+        eventId: "human-event", flowRunId: run.id, operationId: command.operationId,
+        callbackCorrelationId: command.callbackCorrelationId, externalRunId: "zf-run-1",
+        sequence: 2, type: "run.awaiting-human", occurredAt: "2026-07-20T02:01:00.000Z",
+        payload: {}
+      });
+      expect(core.getFlowRunMetrics(run.id)?.counters).toMatchObject({
+        workspace_conflicts: 1,
+        awaiting_human: 1
+      });
+
+      core.recordFlowEvent(run.id, {
+        contractVersion: 1, callbackVersion: 1, producer: "zigma-flow",
+        eventId: "resume-event", flowRunId: run.id, operationId: command.operationId,
+        callbackCorrelationId: command.callbackCorrelationId, externalRunId: "zf-run-1",
+        sequence: 3, type: "run.progress", occurredAt: "2026-07-20T02:02:00.000Z",
+        status: "running",
+        payload: {}
+      });
+      core.recordFlowEvent(run.id, {
+        contractVersion: 1, callbackVersion: 1, producer: "zigma-flow",
+        eventId: "terminal-event", flowRunId: run.id, operationId: command.operationId,
+        callbackCorrelationId: command.callbackCorrelationId, externalRunId: "zf-run-1",
+        sequence: 4, type: "run.completed", occurredAt: "2026-07-20T02:03:00.000Z",
+        payload: {}
+      });
+      const metrics = store.getFlowRun(run.id).metrics!;
+      expect(metrics.counters).toMatchObject({
+        dispatched: 1, started: 1, completed: 1, workspace_conflicts: 1, awaiting_human: 1
+      });
+    });
+
+    it("does not double-count replayed terminal transitions", async () => {
+      const { core, store, task } = setup();
+      const view = await core.startTask(task.id, startInput());
+      const run = view.activeFlowRun!;
+      const command = view.executionCommand!;
+
+      core.recordFlowEvent(run.id, {
+        contractVersion: 1, callbackVersion: 1, producer: "zigma-flow",
+        eventId: "late-terminal", flowRunId: run.id, operationId: command.operationId,
+        callbackCorrelationId: command.callbackCorrelationId, externalRunId: "zf-run-1",
+        sequence: 1, type: "run.completed", occurredAt: "2026-07-20T02:00:00.000Z",
+        payload: {}
+      });
+
+      expect(store.getFlowRun(run.id).metrics?.counters["completed"]).toBe(1);
+      expect(store.getFlowRun(run.id).metrics?.durations["start_to_terminal"].count).toBe(1);
+    });
+
+    it("counts cancel-before-dispatch runs and records quiescence", async () => {
+      const { core, flow, store, task } = setup({ executionMode: "asynchronous" });
+      const accepted = await core.startTask(task.id, { ...startInput(), idempotencyKey: "metrics-cancel" });
+      const run = accepted.activeFlowRun!;
+
+      await core.cancelTask(task.id, "no longer needed");
+      expect(flow.starts).toBe(0);
+
+      const metrics = store.getFlowRun(run.id).metrics!;
+      expect(metrics.counters).toMatchObject({ dispatched: 0, cancelled: 1 });
+      expect(metrics.durations["quiescence"].count).toBe(1);
+    });
+
+    it("attributes admission denial to the run and persists it with the terminal snapshot", async () => {
+      const { core, flow, store, project, task, clock, ids } = setup({
+        executionMode: "asynchronous",
+        executionPolicy: {
+          contractVersion: 1,
+          capacity: { global: 1, perProject: 1, perRepository: 1, perBackend: 1 },
+          admission: { writablePerRepository: 1, queueDiscipline: "fifo", requireDistinctWorkspace: true }
+        }
+      });
+      await core.startTask(task.id, { ...startInput(), idempotencyKey: "metrics-capacity-1" });
+      const secondTask = core.createTask({
+        projectId: project.id, title: "Second", description: "Second", priority: "normal",
+        source: { kind: "api", metadata: {} }, createdBy: { type: "user", id: "owner" },
+        labels: [], metadata: {}
+      });
+      const acceptedSecond = await core.startTask(secondTask.id, { ...startInput(), idempotencyKey: "metrics-capacity-2" });
+      const secondRun = acceptedSecond.activeFlowRun!;
+
+      const runtime = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+        ownerId: "worker-metrics-capacity",
+        metrics: core.metricsRegistry,
+        policyFor: () => store.getExecutionProfile(project.executionProfileId).executionPolicy
+      });
+      await runtime.runOnce();
+
+      expect(core.getFlowRunMetrics(secondRun.id)?.counters["admission_denied"]).toBe(1);
+      await core.cancelTask(secondTask.id, "capacity full");
+      expect(store.getFlowRun(secondRun.id).metrics?.counters).toMatchObject({
+        admission_denied: 1,
+        cancelled: 1
+      });
+    });
+
+    it("counts a terminal reconstruction through reconciliation as a restart", async () => {
+      const clock = new ManualClock();
+      const { core, flow, store, project, task, ids } = setup({ executionMode: "asynchronous", clock });
+      const accepted = await core.startTask(task.id, { ...startInput(), idempotencyKey: "metrics-reconcile" });
+      const command = accepted.executionCommand!;
+      const run = accepted.activeFlowRun!;
+      const admission = new ExecutionAdmissionService(store, clock, ids);
+      const policy = store.getExecutionProfile(project.executionProfileId).executionPolicy;
+      const acquired = admission.admit(command.id, "worker-a", policy, 30_000);
+      expect(acquired.outcome).toBe("acquired");
+      if (acquired.outcome !== "acquired") throw new Error("expected lease");
+
+      flow.startError = new DispatchCrashpointError("provider-dispatch-started");
+      await expect(core.dispatchExecutionCommand(command.id, {
+        fence: executionFence(acquired.lease)
+      })).rejects.toBeInstanceOf(DispatchCrashpointError);
+      expect(store.getExecutionCommand(command.id).status).toBe("dispatching");
+
+      clock.advance(31_000);
+      const takeover = admission.takeoverForReconciliation(command.id, "worker-b", 60_000);
+      expect(takeover).toBeDefined();
+      flow.reconcile = async () => ({
+        outcome: "found", externalRunId: "zf-run-1", status: "completed", quiescent: true, metadata: {}
+      });
+      await core.reconcileExecutionCommand(command.id, executionFence(takeover!));
+
+      expect(store.getFlowRun(run.id).status).toBe("completed");
+      expect(store.getFlowRun(run.id).metrics?.counters).toMatchObject({
+        dispatched: 1, started: 1, completed: 1, reconcile_restarts: 1
+      });
+    });
+
+    it("attributes worker kills and lease fences across a restarted worker sweep", async () => {
+      const clock = new ManualClock();
+      const { core, flow, store, project, task, ids } = setup({ executionMode: "asynchronous", clock });
+      const accepted = await core.startTask(task.id, { ...startInput(), idempotencyKey: "metrics-worker-kill" });
+      const run = accepted.activeFlowRun!;
+      let releaseFlow!: () => void;
+      flow.startBarrier = new Promise<void>((resolve) => { releaseFlow = resolve; });
+      const policyFor = () => store.getExecutionProfile(project.executionProfileId).executionPolicy;
+
+      const workerA = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+        ownerId: "worker-a",
+        leaseDurationMs: 30_000,
+        heartbeatIntervalMs: 10_000,
+        pollIntervalMs: 3_600_000,
+        metrics: core.metricsRegistry,
+        policyFor
+      });
+      const sweepA = workerA.runOnce();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(flow.starts).toBe(1);
+
+      clock.advance(31_000);
+      flow.reconcile = async () => ({
+        outcome: "found", externalRunId: "zf-run-1", status: "completed", quiescent: true, metadata: {}
+      });
+      const workerB = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+        ownerId: "worker-b",
+        leaseDurationMs: 60_000,
+        heartbeatIntervalMs: 20_000,
+        pollIntervalMs: 3_600_000,
+        metrics: core.metricsRegistry,
+        policyFor
+      });
+      await workerB.runOnce();
+
+      releaseFlow();
+      await sweepA;
+
+      const metrics = store.getFlowRun(run.id).metrics!;
+      expect(metrics.counters).toMatchObject({
+        worker_kills: 1,
+        reconcile_restarts: 1,
+        completed: 1
+      });
+      expect(core.getFlowRunMetrics(run.id)?.counters["lease_fences"]).toBe(1);
+    });
+
+    it("continues accumulation from the persisted snapshot in a restarted Core process", async () => {
+      const clock = new ManualClock();
+      const first = setup({ executionMode: "asynchronous", clock });
+      const accepted = await first.core.startTask(first.task.id, { ...startInput(), idempotencyKey: "metrics-restart" });
+      const command = accepted.executionCommand!;
+      const run = accepted.activeFlowRun!;
+      const admission = new ExecutionAdmissionService(first.store, clock, first.ids);
+      const policy = first.store.getExecutionProfile(first.project.executionProfileId).executionPolicy;
+      const acquired = admission.admit(command.id, "worker-a", policy, 30_000);
+      expect(acquired.outcome).toBe("acquired");
+      if (acquired.outcome !== "acquired") throw new Error("expected lease");
+
+      first.flow.startError = new DispatchCrashpointError("provider-dispatch-started");
+      await expect(first.core.dispatchExecutionCommand(command.id, {
+        fence: executionFence(acquired.lease)
+      })).rejects.toBeInstanceOf(DispatchCrashpointError);
+
+      clock.advance(31_000);
+      const restarted = new CoreService({
+        store: first.store,
+        flowExecutor: first.flow,
+        workspaceProvider: new FakeWorkspace(),
+        clock,
+        ids: first.ids,
+        executionMode: "asynchronous"
+      });
+      first.flow.reconcile = async () => ({
+        outcome: "found", externalRunId: "zf-run-1", status: "failed", quiescent: true,
+        exitCode: 1, summary: "crashed", metadata: {}
+      });
+      const takeover = admission.takeoverForReconciliation(command.id, "worker-b", 60_000);
+      expect(takeover).toBeDefined();
+      await restarted.reconcileExecutionCommand(command.id, executionFence(takeover!));
+
+      expect(first.store.getFlowRun(run.id).metrics?.counters).toMatchObject({
+        failed: 1,
+        reconcile_restarts: 1
+      });
+      expect(restarted.getFlowRunMetrics(run.id)).not.toBeNull();
+    });
+
+    it("accepts provider terminal evidence for a task blocked pending reconciliation", async () => {
+      const clock = new ManualClock();
+      const { core, flow, store, project, task, ids } = setup({ executionMode: "asynchronous", clock });
+      const accepted = await core.startTask(task.id, { ...startInput(), idempotencyKey: "reconcile-blocked-terminal" });
+      const command = accepted.executionCommand!;
+      const run = accepted.activeFlowRun!;
+      const admission = new ExecutionAdmissionService(store, clock, ids);
+      const policy = store.getExecutionProfile(project.executionProfileId).executionPolicy;
+      const acquired = admission.admit(command.id, "worker-a", policy, 30_000);
+      expect(acquired.outcome).toBe("acquired");
+      if (acquired.outcome !== "acquired") throw new Error("expected lease");
+
+      flow.startError = new DispatchCrashpointError("provider-dispatch-started");
+      await expect(core.dispatchExecutionCommand(command.id, {
+        fence: executionFence(acquired.lease)
+      })).rejects.toBeInstanceOf(DispatchCrashpointError);
+
+      clock.advance(31_000);
+      const takeover = admission.takeoverForReconciliation(command.id, "worker-b", 60_000);
+      expect(takeover).toBeDefined();
+      flow.reconcile = async () => ({
+        outcome: "found", externalRunId: "zf-run-1", status: "completed", quiescent: false, metadata: {}
+      });
+      await core.reconcileExecutionCommand(command.id, executionFence(takeover!));
+      expect(store.getTask(task.id).status).toBe("blocked");
+      expect(store.getExecutionCommand(command.id).status).toBe("reconciling");
+
+      const terminalEvent = {
+        contractVersion: 1 as const, callbackVersion: 1 as const, producer: "zigma-flow" as const,
+        eventId: "terminal-after-block", flowRunId: run.id, operationId: command.operationId,
+        callbackCorrelationId: command.callbackCorrelationId, type: "run.completed" as const,
+        status: "completed" as const, externalRunId: "zf-run-1", sequence: 1,
+        occurredAt: "2026-07-20T04:00:00.000Z", payload: {}
+      };
+      const projected = core.recordFlowEvent(run.id, terminalEvent);
+      expect(projected.task.status).toBe("completed");
+      expect(projected.activeFlowRun?.status).toBe("completed");
+
+      clock.advance(61_000);
+      const secondTakeover = admission.takeoverForReconciliation(command.id, "worker-c", 60_000);
+      expect(secondTakeover).toBeDefined();
+      flow.reconcile = async () => ({
+        outcome: "found", externalRunId: "zf-run-1", status: "completed", quiescent: true, metadata: {}
+      });
+      await core.reconcileExecutionCommand(command.id, executionFence(secondTakeover!));
+      expect(store.getExecutionCommand(command.id).status).toBe("completed");
+      expect(store.getFlowRun(run.id).metrics?.counters).toMatchObject({
+        completed: 1,
+        reconcile_restarts: 1
+      });
+    });
   });
 });

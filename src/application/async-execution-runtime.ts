@@ -1,5 +1,6 @@
 import type { ExecutionLeaseFence } from "../contracts/ports.js";
 import type { ExecutionPolicy } from "../contracts/schemas.js";
+import { ExecutionMetricsRegistry } from "../domain/execution-metrics.js";
 import type { ExecutionLease, OutboxDelivery } from "../domain/models.js";
 import type { SqliteStore } from "../persistence/sqlite-store.js";
 import {
@@ -23,6 +24,12 @@ export interface AsyncExecutionRuntimeOptions {
   policyFor(commandId: string): ExecutionPolicy;
   /** Fault-injection/telemetry seam. Throw DispatchCrashpointError to emulate process loss. */
   onPhase?(phase: DispatchExecutionPhase, commandId: string): void | Promise<void>;
+  /**
+   * Must be the same registry instance the CoreService uses, so
+   * runtime-attributed counters (admission_denied, lease_fences, worker_kills)
+   * persist on the flow-run rows the CoreService snapshots.
+   */
+  metrics?: ExecutionMetricsRegistry;
 }
 
 export class AsyncExecutionRuntime {
@@ -32,6 +39,7 @@ export class AsyncExecutionRuntime {
   private readonly heartbeatIntervalMs: number;
   private readonly pollIntervalMs: number;
   private readonly workerConcurrency: number;
+  private readonly metrics: ExecutionMetricsRegistry;
 
   constructor(
     private readonly store: SqliteStore,
@@ -39,6 +47,7 @@ export class AsyncExecutionRuntime {
     private readonly admission: ExecutionAdmissionService,
     private readonly options: AsyncExecutionRuntimeOptions
   ) {
+    this.metrics = options.metrics ?? new ExecutionMetricsRegistry();
     this.leaseDurationMs = options.leaseDurationMs ?? 30_000;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? Math.max(10, Math.floor(this.leaseDurationMs / 3));
     this.pollIntervalMs = options.pollIntervalMs ?? 250;
@@ -107,7 +116,12 @@ export class AsyncExecutionRuntime {
       this.options.policyFor(command.id),
       this.leaseDurationMs
     );
-    if (admitted.outcome !== "acquired") return 0;
+    if (admitted.outcome !== "acquired") {
+      if (admitted.outcome === "queued") {
+        this.metrics.record(command.flowRunId, (metrics) => metrics.increment("admission_denied"));
+      }
+      return 0;
+    }
 
     const fence = executionFence(admitted.lease);
     await this.phase("lease-acquired", command.id);
@@ -118,6 +132,8 @@ export class AsyncExecutionRuntime {
       admitted.lease.expiresAt
     );
     if (!claimed) {
+      // The lease was fenced between admission and the durable claim.
+      this.metrics.record(command.flowRunId, (metrics) => metrics.increment("lease_fences"));
       this.admission.release(fence);
       return 0;
     }
@@ -143,12 +159,18 @@ export class AsyncExecutionRuntime {
       if (!lease || lease.status === "released") continue;
 
       if (!(lease.status === "active" && lease.ownerId === this.options.ownerId)) {
+        const foreignActive = lease.status === "active";
         const takeover = this.admission.takeoverForReconciliation(
           command.id,
           this.options.ownerId,
           this.leaseDurationMs
         );
         if (!takeover) continue;
+        // Taking over an active foreign lease means the previous owner's
+        // worker stopped renewing: attribute a worker kill to the run.
+        if (foreignActive) {
+          this.metrics.record(command.flowRunId, (metrics) => metrics.increment("worker_kills"));
+        }
         lease = takeover;
       }
 
@@ -223,8 +245,12 @@ export class AsyncExecutionRuntime {
     error: unknown
   ): void {
     const lease = this.store.getExecutionLease(commandId);
-    if (!this.isCurrentFence(lease, fence) || lease?.status !== "active") return;
     const command = this.store.getExecutionCommand(commandId);
+    if (!this.isCurrentFence(lease, fence) || lease?.status !== "active") {
+      // A stale worker lost its lease; the successor owns reconciliation.
+      this.metrics.record(command.flowRunId, (metrics) => metrics.increment("lease_fences"));
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     if (command.status === "pending") {
       this.store.releaseOutboxClaim(delivery.id, fence, this.admission.now(), message);

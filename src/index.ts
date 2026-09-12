@@ -1,6 +1,7 @@
 export * from "./contracts/index.js";
 export * from "./domain/models.js";
 export * from "./domain/errors.js";
+export * from "./domain/execution-metrics.js";
 export * from "./application/core-service.js";
 export * from "./application/runtime.js";
 export * from "./application/execution-admission.js";

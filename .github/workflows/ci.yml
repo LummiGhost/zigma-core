@@ -80,3 +80,35 @@ jobs:
         env:
           ZIGMA_FLOW_REPO: ${{ github.workspace }}/.providers/zigma-flow
           ZIGMA_WORKSPACE_REPO: ${{ github.workspace }}/.providers/zigma-workspace
+
+  m4-cross-repo-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+      - run: npm ci
+      # M4 provider pins: Flow parallel-dispatch fixes (PR #322) and
+      # Workspace per-workspace retention flags + repo-cache concurrency
+      # hardening (PR #44, PR #45).
+      # Same reproducibility rationale as the m0 gate.
+      - uses: actions/checkout@v4
+        with:
+          repository: LummiGhost/zigma-flow
+          ref: eb48a5fb9280fe7b9e8fc794d4913bde456d2630
+          path: .providers/zigma-flow
+      - run: pnpm install --frozen-lockfile
+        working-directory: .providers/zigma-flow
+      - uses: actions/checkout@v4
+        with:
+          repository: LummiGhost/zigma-workspace
+          ref: edac5df2e6bc80952c36db79d5478a9a5335d807
+          path: .providers/zigma-workspace
+      - run: npm ci
+        working-directory: .providers/zigma-workspace
+      - run: npm run test:m4-cross-repo
+        env:
+          ZIGMA_FLOW_REPO: ${{ github.workspace }}/.providers/zigma-flow
+          ZIGMA_WORKSPACE_REPO: ${{ github.workspace }}/.providers/zigma-workspace

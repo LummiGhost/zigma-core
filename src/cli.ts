@@ -1,8 +1,9 @@
 #!/usr/bin/env node
+import { existsSync, writeFileSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { Command } from "commander";
-import { CoreService } from "./application/core-service.js";
+import { CoreService, type DispatchExecutionPhase } from "./application/core-service.js";
 import { AsyncExecutionRuntime } from "./application/async-execution-runtime.js";
 import { ExecutionAdmissionService } from "./application/execution-admission.js";
 import { SystemClock, UuidGenerator } from "./application/runtime.js";
@@ -13,6 +14,28 @@ import { SqliteStore } from "./persistence/sqlite-store.js";
 
 async function readJson(path: string): Promise<unknown> {
   return JSON.parse(await readFile(resolve(path), "utf8")) as unknown;
+}
+
+/**
+ * Fault-injection seam for real-process tests: when
+ * ZIGMA_CORE_CRASHPOINT_PHASE names a dispatch phase, the runtime pauses at
+ * that phase while ZIGMA_CORE_CRASHPOINT_BLOCK_FILE exists (signalling via
+ * ZIGMA_CORE_CRASHPOINT_STARTED_FILE), so a harness can kill the process in
+ * an otherwise unreachable crash window. Absent the env vars this is a no-op.
+ */
+function phasePauseHook(env: NodeJS.ProcessEnv) {
+  const phase = env["ZIGMA_CORE_CRASHPOINT_PHASE"];
+  if (!phase) return undefined;
+  const blockFile = env["ZIGMA_CORE_CRASHPOINT_BLOCK_FILE"];
+  const startedFile = env["ZIGMA_CORE_CRASHPOINT_STARTED_FILE"];
+  return async (current: DispatchExecutionPhase): Promise<void> => {
+    if (current !== phase) return;
+    if (!blockFile || !existsSync(blockFile)) return;
+    if (startedFile) writeFileSync(startedFile, "blocking", "utf8");
+    while (existsSync(blockFile)) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  };
 }
 
 async function openCore(dbPath: string, executionMode: "synchronous" | "asynchronous" = "synchronous"): Promise<{ core: CoreService; store: SqliteStore; clock: SystemClock; ids: UuidGenerator }> {
@@ -59,6 +82,8 @@ async function main(): Promise<void> {
       const runtime = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
         ownerId: `core-${process.pid}`,
         workerConcurrency,
+        metrics: core.metricsRegistry,
+        onPhase: phasePauseHook(process.env),
         policyFor(commandId) {
           const command = store.getExecutionCommand(commandId);
           const project = store.getProject(command.projectId);
@@ -147,6 +172,18 @@ async function main(): Promise<void> {
       const { core, store } = await openCore(program.opts<{ db: string }>().db);
       try {
         print({ data: await core.cancelTask(id, options.reason) });
+      } finally {
+        store.close();
+      }
+    });
+
+  program
+    .command("metrics <flowRunId>")
+    .description("Show execution metrics for a flow run")
+    .action(async (flowRunId: string) => {
+      const { core, store } = await openCore(program.opts<{ db: string }>().db);
+      try {
+        print({ data: core.getFlowRunMetrics(flowRunId) });
       } finally {
         store.close();
       }
