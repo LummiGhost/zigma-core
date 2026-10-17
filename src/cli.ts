@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { Command } from "commander";
@@ -64,7 +64,7 @@ async function main(): Promise<void> {
   program
     .name("zigma-core")
     .description("Zigma platform control plane")
-    .version("0.1.0")
+    .version((JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version)
     .option("--db <path>", "SQLite database path", ".zigma-core/core.db");
 
   program
