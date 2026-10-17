@@ -1162,6 +1162,9 @@ export class CoreService {
     this.store.fencedTransaction(fence, now, () => {
       const command = this.store.getExecutionCommand(commandId);
       if (["completed", "failed", "cancelled"].includes(command.status)) return;
+      // Preserve the dispatch failure when truth cannot be queried without an ID.
+      if (reason === "Core has no external Flow run id to inspect" && command.lastError) reason = command.lastError;
+      if (command.status === "reconciling" && command.lastError === reason) return;
       this.store.updateExecutionCommand({
         ...command,
         ...(command.status === "cancel_requested" ? {} : { status: "reconciling" }),

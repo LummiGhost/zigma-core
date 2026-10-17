@@ -25,6 +25,7 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:readiness": "node tests/run-readiness.mjs",
     "test:m0-cross-repo": "node tests/run-m0-cross-repo-contracts.mjs",
     "test:m3-cross-repo": "node tests/run-m3-cross-repo-contracts.mjs",
     "test:m4-cross-repo": "node tests/run-m4-cross-repo-contracts.mjs",

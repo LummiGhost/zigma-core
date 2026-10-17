@@ -1,6 +1,6 @@
 import { chmodSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { spawnSync } from "node:child_process";
+import { execaSync } from "execa";
 import { fileURLToPath } from "node:url";
 
 const coreRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -20,13 +20,11 @@ if (packageName(flowRoot) !== "@zigma-ai/zigma-flow") throw new Error("ZIGMA_FLO
 if (packageName(workspaceRoot) !== "@zigma-ai/zigma-workspace") throw new Error("ZIGMA_WORKSPACE_REPO is not zigma-workspace");
 
 function run(command, args, cwd, env = process.env) {
-  const result = spawnSync(command, args, {
-    cwd,
-    env,
-    stdio: "inherit",
-    shell: process.platform === "win32"
+  const javascript = /\.[cm]?js$/i.test(command);
+  const result = execaSync(javascript ? process.execPath : command, javascript ? [command, ...args] : args, {
+    cwd, env, stdio: "inherit", reject: false, windowsHide: true
   });
-  if (result.status !== 0) process.exit(result.status ?? 1);
+  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1);
 }
 
 run("pnpm", ["run", "build"], flowRoot);

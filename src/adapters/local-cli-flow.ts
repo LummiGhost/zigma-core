@@ -1,6 +1,7 @@
 import { writeFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { WINDOWS_FLOW_LAUNCHER } from "./flow-cli-launcher.js";
 import { execa } from "execa";
 import type {
   FlowCancelRequest,
@@ -147,6 +148,9 @@ function parseInvokeJson(stdout: string, processExitCode: number): FlowStartResu
     );
   }
 
+  if (envelope.runId === "(error)") {
+    throw new IntegrationError(`zigma-flow rejected invocation before creating a run: ${envelope.error?.message ?? "unknown startup error"}`, { exitCode: processExitCode });
+  }
   if (!envelope.runId || typeof envelope.runId !== "string") {
     throw new IntegrationError("zigma-flow --json output missing required field: runId", {
       stdoutTail: stdout.slice(-4_000)
@@ -390,7 +394,10 @@ export class LocalCliFlowExecutor implements FlowExecutor {
 
     try {
       await writeFile(contextFilePath, JSON.stringify(buildContextFilePayload(request), null, 2), "utf8");
-      const result = await execa(request.command, args, {
+      const launch = process.platform === "win32"
+        ? { command: process.execPath, args: ["--input-type=module", "-e", WINDOWS_FLOW_LAUNCHER, import.meta.resolve("execa"), request.command, ...args] }
+        : { command: request.command, args };
+      const result = await execa(launch.command, launch.args, {
         cwd: request.projectRoot,
         env: { ...process.env, ...request.environment },
         timeout: request.timeoutMs,
@@ -415,7 +422,7 @@ export class LocalCliFlowExecutor implements FlowExecutor {
         };
       }
       const parsed = parseInvokeJson(stdout, result.exitCode ?? 1);
-      if ((result.exitCode ?? 1) !== 0 && parsed.status !== "awaiting_human") {
+      if ((result.exitCode ?? 1) !== 0 && !["awaiting_human", "cancelled"].includes(parsed.status)) {
         const stderrTail = (result.stderr ?? "").trim().slice(-4_000);
         return {
           ...parsed,

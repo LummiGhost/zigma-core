@@ -35,6 +35,7 @@ export interface AsyncExecutionRuntimeOptions {
 export class AsyncExecutionRuntime {
   private timer?: ReturnType<typeof setInterval>;
   private running = false;
+  private readonly reconcileAfter = new Map<string, number>();
   private readonly leaseDurationMs: number;
   private readonly heartbeatIntervalMs: number;
   private readonly pollIntervalMs: number;
@@ -155,6 +156,8 @@ export class AsyncExecutionRuntime {
 
   private async reconcileRecoverableCommands(): Promise<void> {
     for (const command of this.store.listInFlightExecutionCommands()) {
+      if (Date.now() < (this.reconcileAfter.get(command.id) ?? 0)) continue;
+      this.reconcileAfter.set(command.id, Date.now() + 5_000);
       let lease = this.store.getExecutionLease(command.id);
       if (!lease || lease.status === "released") continue;
 
@@ -211,6 +214,7 @@ export class AsyncExecutionRuntime {
   }
 
   private async finalizeDelivery(commandId: string, delivery: OutboxDelivery, fence: ExecutionLeaseFence): Promise<void> {
+    this.reconcileAfter.delete(commandId);
     const command = this.store.getExecutionCommand(commandId);
     const currentDelivery = this.store.getOutboxDeliveryForCommand(commandId) ?? delivery;
     if (currentDelivery.status === "claimed") {

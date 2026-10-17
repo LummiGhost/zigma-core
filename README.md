@@ -36,6 +36,15 @@ npm install
 npm run check
 ```
 
+### Full local readiness gate
+
+With the sibling checkout variables below set, `npm run test:readiness` typechecks
+and builds all three repositories, runs all component suites (including real
+provider tests), and runs Flow's built two-CLI lifecycle gate. It fails on the
+first failed check. It does not call a paid model. An authenticated Agent CLI
+smoke remains a separate check because credentials and provider routing are
+operator-controlled.
+
 ### Real provider-contract gate
 
 The ordinary unit suite skips the real-provider file when sibling source
