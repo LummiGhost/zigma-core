@@ -1448,3 +1448,32 @@ describe("CoreService", () => {
     });
   });
 });
+
+
+describe("reconciliation diagnostics", () => {
+  it("preserves the dispatch cause and does not duplicate unchanged audit records", async () => {
+    const clock = new ManualClock();
+    const {core,flow,store,project,task,ids} = setup({executionMode:"asynchronous",clock});
+    const accepted = await core.startTask(task.id,{...startInput(),idempotencyKey:"reconcile-cause"});
+    flow.startError = new Error("original launch failure");
+    let inspections=0;
+    flow.reconcile = async () => { inspections++; return {outcome:"unknown",reason:"Core has no external Flow run id to inspect",metadata:{}}; };
+    const runtime = new AsyncExecutionRuntime(store,core,new ExecutionAdmissionService(store,clock,ids),{
+      ownerId:"cause-worker",policyFor:()=>store.getExecutionProfile(project.executionProfileId).executionPolicy
+    });
+    await runtime.runOnce();
+    expect(store.getExecutionCommand(accepted.executionCommand!.id).lastError).toContain("original launch failure");
+    const admission = new ExecutionAdmissionService(store,clock,ids);
+    const lease=admission.takeoverForReconciliation(accepted.executionCommand!.id,"cause-worker",30000)!;
+    const fence=executionFence(lease);
+    await core.reconcileExecutionCommand(accepted.executionCommand!.id,fence);
+    const count=core.listTaskAudit(task.id).length;
+    await core.reconcileExecutionCommand(accepted.executionCommand!.id,fence);
+    expect(core.listTaskAudit(task.id)).toHaveLength(count);
+    expect(store.getExecutionCommand(accepted.executionCommand!.id).lastError).toContain("original launch failure");
+    await runtime.runOnce();
+    const inspectionsBeforePoll=inspections;
+    await runtime.runOnce();
+    expect(inspections).toBe(inspectionsBeforePoll);
+  });
+});

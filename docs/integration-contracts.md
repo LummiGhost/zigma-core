@@ -136,3 +136,9 @@ job→run 顺序 `cleanup --strict`，registry 收敛为 CLEANED。M4 证据测�
 状态含义需要提高主版本。Provider 先发布向后兼容能力，Core 再通过 capability
 协商启用。Rollback 先停止新 admission，等待/取消并 reconcile active work，
 不得让新旧 dispatch mode 同时处理同一 command。
+
+## Windows CLI ownership and startup diagnostics
+
+Core starts Flow through a detached Node owner on Windows. That owner invokes the configured CLI with inherited pipe handles and without detaching a command shim. This preserves stdout from npm-style `.cmd` wrappers while allowing an in-flight Flow invocation to outlive a Core restart. CLI commands and arguments are passed separately; the owner does not build shell command strings. Cross-repository gate scripts likewise invoke built JavaScript through Node.
+
+A pre-run `(error)` sentinel is rejected as startup failure, never stored as an external run ID. Unknown provider truth remains blocked without redispatch or cleanup. When no run ID is available, reconciliation preserves the dispatch cause and does not append duplicate unchanged reconciliation-required audit events. The runtime limits reconciliation checks to once per five seconds per command; a restarted runtime may check immediately. This does not release capacity or bypass provider quiescence requirements.

@@ -483,3 +483,17 @@ describe("LocalCliFlowExecutor command contracts", () => {
     })).rejects.toThrow("zigma-flow abort contract version mismatch: expected 1, got 2");
   });
 });
+
+
+describe("Flow startup failures", () => {
+  it("does not persist a sentinel as an external run ID", async () => {
+    mockExeca.mockResolvedValueOnce({stdout:jsonEnvelope({runId:"(error)",status:"failed",error:{message:"Workflow validation failed"}}),exitCode:1});
+    await expect(executor.start(defaultRequest())).rejects.toThrow("rejected invocation before creating a run: Workflow validation failed");
+  });
+});
+
+
+it("preserves a cancelled Flow result with its nonzero CLI exit status", async () => {
+  mockExeca.mockResolvedValueOnce({stdout:jsonEnvelope({status:"cancelled",exitCode:1}),exitCode:1});
+  expect(await executor.start(defaultRequest())).toMatchObject({status:"cancelled",exitCode:1});
+});
