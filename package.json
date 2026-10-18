@@ -3,6 +3,10 @@
   "version": "0.1.1",
   "description": "Zigma platform control plane for projects, tasks, permissions, approvals, and evidence.",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LummiGhost/zigma-core.git"
+  },
   "type": "module",
   "bin": {
     "zigma-core": "./dist/cli.js"
