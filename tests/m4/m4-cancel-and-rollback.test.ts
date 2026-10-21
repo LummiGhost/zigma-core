@@ -1,14 +1,12 @@
 /**
  * M4 cancel and rollback — env-gated. A task is cancelled through the Core
- * API while its job attempt holds; the abort is delivered to the live Flow
+ * API while its job attempt holds; Core delivers abort to the live Flow
  * owner, which acknowledges quiescence, tears the run down with per-result
  * retention (failure: cleanup), and leaves the repository untouched.
  */
 
 import { afterEach, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   cancelTask,
@@ -28,7 +26,6 @@ import {
   killCoreProcess,
   makeManagedProject,
   pollTaskUntil,
-  readRunLogTail,
   rmWithRetry,
   spawnCore,
   startPayload,
@@ -112,43 +109,19 @@ describeRealPlatform("M4 cancel and rollback (real Core + Flow + Workspace CLIs)
         return row && existsSync(join(row.path, "job-marker.txt")) ? row : undefined;
       });
 
-      // Core's cancellation API marks the command durable; the abort below
-      // stands in for the deferred sweep delivery (the dispatch worker owns
-      // the runtime poll loop while the provider invoke is live).
+      // Core alone must deliver cancellation while its invoke call is live.
+      // A direct Flow abort here would hide cancellation delivery defects.
       await cancelTask(core.baseUrl, taskId, "m4 cancel rollback");
-      expect((await getTaskView(core.baseUrl, taskId)).task.status).toBe("blocked");
-
-      // Deliver the abort to the live owner; quiescence is acknowledged only
-      // after the managed teardown (reconcile + strict cleanup) finishes.
-      const abortJson = execFileSync(process.execPath, [
-        flowCliPath!,
-        "--cwd", repo.repository,
-        "abort",
-        "--run", externalRunId,
-        "--reason", "m4 cancel rollback",
-        "--json"
-      ], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-      const abortEnvelope = JSON.parse(abortJson) as {
-        status: string;
-        data?: { quiescent?: boolean; ownerStatus?: string };
-        error?: { code?: string; message?: string };
-      };
-      const abortDump = [
-        `abort envelope: ${abortJson.trim()}`,
-        `run log: ${await readRunLogTail(repo.repository, externalRunId)}`,
-        `core output: ${core.output.join("")}`
-      ].join("\n");
-      expect(abortEnvelope.data?.quiescent, abortDump).toBe(true);
-      expect(abortEnvelope.data?.ownerStatus, abortDump).toBe("cancelled");
 
       const terminal = await pollTaskUntil(core.baseUrl, taskId, (candidate) => {
         const status = candidate.activeFlowRun?.status;
         if (status === "completed" || status === "failed") {
           throw new Error(`run reached ${status} instead of cancelled`);
         }
-        return status === "cancelled" ? true : undefined;
-      }, 300_000);
+        return status === "cancelled" && candidate.executionCommand?.status === "cancelled" ? true : undefined;
+      }, 60_000);
       expect(terminal.task.status).toBe("cancelled");
+      expect((await getTaskView(core.baseUrl, taskId)).executionCommand?.status).toBe("cancelled");
 
       const metrics = await getRunMetrics(core.baseUrl, run.id);
       expect(metrics!.counters).toMatchObject({

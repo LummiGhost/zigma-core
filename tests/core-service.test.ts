@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   Clock,
   FlowCancelRequest,
@@ -63,6 +63,7 @@ class FakeFlow implements FlowExecutor {
   readonly cancellations: FlowCancelRequest[] = [];
   starts = 0;
   startBarrier?: Promise<void>;
+  cancelBarrier?: Promise<void>;
   startError?: Error;
   reconcile?: FlowExecutor["reconcile"];
 
@@ -97,8 +98,28 @@ class FakeFlow implements FlowExecutor {
 
   async cancel(request: FlowCancelRequest): Promise<FlowCancelResult> {
     this.cancellations.push(request);
+    await this.cancelBarrier;
     return this.cancelResult;
   }
+}
+
+async function waitForCondition(condition: () => boolean, message: string): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error(message);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+function announceLiveInvocation(core: CoreService, accepted: Awaited<ReturnType<CoreService["startTask"]>>): void {
+  const run = accepted.activeFlowRun!;
+  const command = accepted.executionCommand!;
+  core.recordFlowEvent(run.id, {
+    contractVersion: 1, callbackVersion: 1, producer: "zigma-flow",
+    eventId: "live-invocation", flowRunId: run.id, operationId: command.operationId,
+    callbackCorrelationId: command.callbackCorrelationId, externalRunId: "zf-running",
+    sequence: 1, type: "run.progress", occurredAt: "2026-07-20T00:00:00.000Z", payload: {}
+  });
 }
 
 class FakeWorkspace implements WorkspaceProvider {
@@ -637,38 +658,177 @@ describe("CoreService", () => {
     expect(() => admission.renew(staleFence, 60_000)).toThrow(ConflictError);
   });
 
-  it("keeps capacity reserved through cancellation request until Flow proves quiescence", async () => {
-    const { core, flow, store, project, task, clock, ids } = setup({ executionMode: "asynchronous" });
+  it.each(["running-before-ack", "running-after-ack", "error-after-ack"] as const)("delivers cancellation while start is pending without duplicate dispatch, abort, or receipt acknowledgement (%s)", async (lateOutcome) => {
+    const clock = new ManualClock();
+    const { core, flow, store, project, task, ids } = setup({ executionMode: "asynchronous", clock });
+    // The stale dispatch result must never roll back an acknowledged cancellation.
     flow.result = { externalRunId: "zf-running", status: "running", exitCode: 0, metadata: {} };
+    if (lateOutcome === "error-after-ack") flow.startError = new Error("late provider transport error after quiescent cancellation");
     flow.cancelResult = { externalRunId: "zf-running", status: "cancelled", quiescent: true, metadata: { reaped: true } };
     let releaseFlow!: () => void;
+    let acknowledgeCancellation!: () => void;
     flow.startBarrier = new Promise<void>((resolve) => { releaseFlow = resolve; });
+    flow.cancelBarrier = new Promise<void>((resolve) => { acknowledgeCancellation = resolve; });
+    let reconciliations = 0;
+    flow.reconcile = async () => {
+      reconciliations += 1;
+      return { outcome: "not_found", safeToRedispatch: true, metadata: {} };
+    };
     const accepted = await core.startTask(task.id, { ...startInput(), idempotencyKey: "cancel-race" });
+    const commandId = accepted.executionCommand!.id;
+    const acknowledgeReceipt = vi.spyOn(store, "acknowledgeOutboxDelivery");
     const runtime = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
       ownerId: "worker-cancel-race",
       leaseDurationMs: 60_000,
+      heartbeatIntervalMs: 5,
+      pollIntervalMs: 5,
       policyFor: () => store.getExecutionProfile(project.executionProfileId).executionPolicy
     });
     const dispatch = runtime.runOnce();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(store.getExecutionCommand(accepted.executionCommand!.id).status).toBe("dispatching");
+    runtime.start();
+    try {
+      await waitForCondition(() => flow.starts === 1, "Flow did not start");
+      const lease = store.getExecutionLease(commandId)!;
+      await core.cancelTask(task.id, "user requested cancellation");
+      // Cancellation cannot guess a run id or invoke generic reconciliation.
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(flow.cancellations).toHaveLength(0);
+      expect(reconciliations).toBe(0);
+      announceLiveInvocation(core, accepted);
+      await waitForCondition(() => flow.cancellations.length === 1,
+        "Core cancellation never reached the live provider while start remained pending");
 
-    await core.cancelTask(task.id, "user requested cancellation");
-    expect(store.getExecutionCommand(accepted.executionCommand!.id).status).toBe("cancel_requested");
-    expect(core.getTask(task.id).status).toBe("blocked");
-    expect(store.getExecutionLease(accepted.executionCommand!.id)?.status).toBe("active");
-    expect(flow.cancellations).toHaveLength(0);
+      await core.cancelTask(task.id, "duplicate request while abort is in flight");
+      await Promise.all([runtime.runOnce(), runtime.runOnce(), runtime.runOnce()]);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(flow.starts).toBe(1);
+      expect(flow.cancellations).toHaveLength(1);
+      expect(flow.cancellations[0]).toMatchObject({
+        externalRunId: "zf-running", executionFence: executionFence(lease)
+      });
+      expect(reconciliations).toBe(0);
+      expect(store.getExecutionCommand(commandId).status).toBe("cancel_requested");
+      expect(store.getExecutionLease(commandId)?.status).toBe("active");
+      expect(acknowledgeReceipt).not.toHaveBeenCalled();
 
-    releaseFlow();
-    expect(await dispatch).toBe(1);
-    expect(flow.cancellations).toHaveLength(1);
-    expect(store.getExecutionCommand(accepted.executionCommand!.id)).toMatchObject({
-      status: "cancelled",
-      cancelRequestedAt: expect.any(String),
-      cancelAcknowledgedAt: expect.any(String)
+      if (lateOutcome === "running-before-ack") {
+        releaseFlow();
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        expect(flow.cancellations).toHaveLength(1);
+        expect(store.getExecutionCommand(commandId).status).toBe("cancel_requested");
+        expect(store.getExecutionLease(commandId)?.status).toBe("active");
+        expect(store.getOutboxDeliveryForCommand(commandId)?.status).toBe("claimed");
+        expect(acknowledgeReceipt).not.toHaveBeenCalled();
+      }
+      acknowledgeCancellation();
+      await waitForCondition(() => store.getExecutionCommand(commandId).status === "cancelled",
+        "Quiescent provider acknowledgement was not recorded");
+      if (lateOutcome !== "running-before-ack") {
+        // The original dispatch still owns its receipt until it returns.
+        expect(store.getExecutionLease(commandId)?.status).toBe("active");
+        expect(store.getOutboxDeliveryForCommand(commandId)?.status).toBe("claimed");
+        expect(acknowledgeReceipt).not.toHaveBeenCalled();
+      }
+      releaseFlow();
+      expect(await dispatch).toBe(1);
+      await runtime.stop();
+      expect(store.getExecutionCommand(commandId)).toMatchObject({
+        status: "cancelled", cancelRequestedAt: expect.any(String), cancelAcknowledgedAt: expect.any(String)
+      });
+      expect(core.getTask(task.id).status).toBe("cancelled");
+      expect(store.getExecutionLease(commandId)?.status).toBe("released");
+      expect(acknowledgeReceipt).toHaveBeenCalledTimes(1);
+      expect(flow.starts).toBe(1);
+      expect(flow.cancellations).toHaveLength(1);
+    } finally {
+      acknowledgeCancellation();
+      releaseFlow();
+      await dispatch.catch(() => {});
+      await runtime.stop();
+      acknowledgeReceipt.mockRestore();
+    }
+  });
+
+  it("does not deliver active cancellation after its dispatch fence has been taken over", async () => {
+    const clock = new ManualClock();
+    const { core, flow, store, project, task, ids } = setup({ executionMode: "asynchronous", clock });
+    let releaseFlow!: () => void;
+    flow.startBarrier = new Promise<void>((resolve) => { releaseFlow = resolve; });
+    const accepted = await core.startTask(task.id, { ...startInput(), idempotencyKey: "cancel-stale-owner" });
+    const commandId = accepted.executionCommand!.id;
+    const admission = new ExecutionAdmissionService(store, clock, ids);
+    const runtime = new AsyncExecutionRuntime(store, core, admission, {
+      ownerId: "worker-stale-cancel", leaseDurationMs: 60_000,
+      heartbeatIntervalMs: 3_600_000, pollIntervalMs: 5,
+      policyFor: () => store.getExecutionProfile(project.executionProfileId).executionPolicy
     });
-    expect(core.getTask(task.id).status).toBe("cancelled");
-    expect(store.getExecutionLease(accepted.executionCommand!.id)?.status).toBe("released");
+    const dispatch = runtime.runOnce();
+    runtime.start();
+    try {
+      await waitForCondition(() => flow.starts === 1, "Flow did not start");
+      announceLiveInvocation(core, accepted);
+      const oldLease = store.getExecutionLease(commandId)!;
+      clock.advance(61_000);
+      const successor = admission.takeoverForReconciliation(commandId, "successor-worker", 60_000)!;
+      expect(successor.fencingToken).toBeGreaterThan(oldLease.fencingToken);
+      await core.cancelTask(task.id, "cancel after owner takeover");
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(flow.cancellations).toHaveLength(0);
+      expect(flow.starts).toBe(1);
+      expect(store.getExecutionCommand(commandId).status).toBe("cancel_requested");
+      expect(store.getExecutionLease(commandId)).toMatchObject({
+        ownerId: "successor-worker", fencingToken: successor.fencingToken, status: "active"
+      });
+    } finally {
+      releaseFlow();
+      await dispatch.catch(() => {});
+      await runtime.stop();
+    }
+    expect(store.getExecutionCommand(commandId).status).toBe("cancel_requested");
+    expect(store.getExecutionLease(commandId)?.ownerId).toBe("successor-worker");
+  });
+
+  it("waits for an in-flight cancellation control operation when the runtime stops", async () => {
+    const clock = new ManualClock();
+    const { core, flow, store, project, task, ids } = setup({ executionMode: "asynchronous", clock });
+    let releaseFlow!: () => void;
+    let acknowledgeCancellation!: () => void;
+    flow.startBarrier = new Promise<void>((resolve) => { releaseFlow = resolve; });
+    flow.cancelBarrier = new Promise<void>((resolve) => { acknowledgeCancellation = resolve; });
+    flow.result = { externalRunId: "zf-running", status: "cancelled", exitCode: 1, metadata: {} };
+    flow.cancelResult = { externalRunId: "zf-running", status: "cancelled", quiescent: true, metadata: {} };
+    const accepted = await core.startTask(task.id, { ...startInput(), idempotencyKey: "cancel-stop" });
+    const runtime = new AsyncExecutionRuntime(store, core, new ExecutionAdmissionService(store, clock, ids), {
+      ownerId: "worker-cancel-stop", leaseDurationMs: 60_000,
+      heartbeatIntervalMs: 5, pollIntervalMs: 5,
+      policyFor: () => store.getExecutionProfile(project.executionProfileId).executionPolicy
+    });
+    const dispatch = runtime.runOnce();
+    runtime.start();
+    let stopping: Promise<void> | undefined;
+    try {
+      await waitForCondition(() => flow.starts === 1, "Flow did not start");
+      announceLiveInvocation(core, accepted);
+      await core.cancelTask(task.id, "cancel before stopping runtime");
+      await waitForCondition(() => flow.cancellations.length === 1, "No pending cancellation control operation");
+      let stopped = false;
+      stopping = runtime.stop().then(() => { stopped = true; });
+      releaseFlow();
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(stopped).toBe(false);
+      acknowledgeCancellation();
+      await dispatch;
+      await stopping;
+      expect(stopped).toBe(true);
+      expect(flow.starts).toBe(1);
+      expect(flow.cancellations).toHaveLength(1);
+      expect(store.getExecutionCommand(accepted.executionCommand!.id).status).toBe("cancelled");
+    } finally {
+      acknowledgeCancellation();
+      releaseFlow();
+      await dispatch.catch(() => {});
+      await (stopping ?? runtime.stop());
+    }
   });
 
   it("fails closed after an ambiguous Workspace provider failure instead of replaying Flow", async () => {
