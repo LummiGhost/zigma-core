@@ -134,6 +134,7 @@ export class CoreService {
   private readonly clock: Clock;
   private readonly ids: IdGenerator;
   private readonly executionMode: "synchronous" | "asynchronous";
+  private readonly cancellationDeliveries = new Map<string, Promise<void>>();
   /** Shared with the async runtime so runtime-attributed counters persist on the same run rows. */
   readonly metricsRegistry: ExecutionMetricsRegistry;
 
@@ -768,8 +769,11 @@ export class CoreService {
 
       const responseAt = this.clock.now();
       this.store.fencedTransaction(options.fence, responseAt, () => {
-        this.applyFlowResultState(run.id, result, payload.callerContext.actor);
         const latest = this.store.getExecutionCommand(command.id);
+        // An independently acknowledged cancellation wins over a late invoke
+        // projection (including a stale nonterminal provider response).
+        if (["completed", "failed", "cancelled"].includes(latest.status)) return;
+        this.applyFlowResultState(run.id, result, payload.callerContext.actor);
         const cancellationStillPending = latest.status === "cancel_requested"
           && !["completed", "failed", "cancelled"].includes(result.status);
         this.store.updateExecutionCommand({
@@ -807,6 +811,10 @@ export class CoreService {
       return this.getTaskView(task.id);
     } catch (error) {
       if (error instanceof DispatchCrashpointError) throw error;
+      if (["completed", "failed", "cancelled"].includes(this.store.getExecutionCommand(command.id).status)) {
+        this.store.assertExecutionFence(options.fence, this.clock.now());
+        return this.getTaskView(task.id);
+      }
       const message = error instanceof Error ? error.message : String(error);
       const failedAt = this.clock.now();
       try {
@@ -993,6 +1001,29 @@ export class CoreService {
     }
   }
 
+  /** Deliver cancellation to a live dispatch without reconciling or replaying it. */
+  async deliverActiveCancellation(commandId: string, fence: ExecutionLeaseFence): Promise<void> {
+    if (fence.commandId !== commandId) {
+      throw new ConflictError("Execution fence does not belong to the cancelled command", { commandId });
+    }
+    this.store.assertExecutionFence(fence, this.clock.now());
+    const lease = this.store.getExecutionLease(commandId);
+    if (lease?.status !== "active") {
+      throw new ConflictError("Active cancellation requires the live dispatch lease", { commandId });
+    }
+    const command = this.store.getExecutionCommand(commandId);
+    if (command.status !== "cancel_requested") return;
+    // Wait for the normal correlated birth callback; do not guess or inspect
+    // provider identity concurrently with a still-pending start invocation.
+    if (!this.store.getFlowRun(command.flowRunId).externalRunId) return;
+    await this.propagateCancellation(
+      command,
+      fence,
+      String((command.payload as Record<string, unknown>)["cancellationReason"] ?? "Cancellation requested during active dispatch"),
+      SYSTEM_ACTOR
+    );
+  }
+
   private requestAsynchronousCancellation(
     commandId: string,
     reason: string,
@@ -1086,7 +1117,22 @@ export class CoreService {
     }, command.taskId);
   }
 
-  private async propagateCancellation(
+  private propagateCancellation(
+    command: ExecutionCommand,
+    fence: ExecutionLeaseFence,
+    reason: string,
+    actor: AuditEvent["actor"]
+  ): Promise<void> {
+    const existing = this.cancellationDeliveries.get(command.id);
+    if (existing) return existing;
+    const delivery = this.performCancellation(command, fence, reason, actor).finally(() => {
+      this.cancellationDeliveries.delete(command.id);
+    });
+    this.cancellationDeliveries.set(command.id, delivery);
+    return delivery;
+  }
+
+  private async performCancellation(
     command: ExecutionCommand,
     fence: ExecutionLeaseFence,
     reason: string,

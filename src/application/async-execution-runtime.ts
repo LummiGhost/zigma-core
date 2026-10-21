@@ -34,6 +34,9 @@ export interface AsyncExecutionRuntimeOptions {
 
 export class AsyncExecutionRuntime {
   private timer?: ReturnType<typeof setInterval>;
+  private cancellationTimer?: ReturnType<typeof setInterval>;
+  private readonly cancellationControls = new Map<string, Promise<void>>();
+  private readonly activeDispatches = new Map<string, ExecutionLeaseFence>();
   private running = false;
   private readonly reconcileAfter = new Map<string, number>();
   private readonly leaseDurationMs: number;
@@ -65,12 +68,43 @@ export class AsyncExecutionRuntime {
     void this.runOnce();
     this.timer = setInterval(() => { void this.runOnce(); }, this.pollIntervalMs);
     this.timer.unref?.();
+    this.cancellationTimer = setInterval(() => { void this.pollActiveCancellations(); }, this.pollIntervalMs);
+    this.cancellationTimer.unref?.();
   }
 
   async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
+    if (this.cancellationTimer) clearInterval(this.cancellationTimer);
     this.timer = undefined;
-    while (this.running) await new Promise((resolve) => setTimeout(resolve, 5));
+    this.cancellationTimer = undefined;
+    while (this.running || this.cancellationControls.size > 0) {
+      await Promise.allSettled([...this.cancellationControls.values()]);
+      if (this.running) await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+
+  private pollActiveCancellations(): void {
+    for (const [commandId, fence] of this.activeDispatches) {
+      try {
+        if (this.cancellationControls.has(commandId)) continue;
+        const lease = this.store.getExecutionLease(commandId);
+        if (!this.isCurrentFence(lease, fence) || lease?.status !== "active") continue;
+        if (this.store.getExecutionCommand(commandId).status !== "cancel_requested") continue;
+        // Start independent control requests without awaiting another command.
+        // Each dispatch retains ownership of only its own receipt and control.
+        const control = this.core.deliverActiveCancellation(commandId, fence).catch(() => {
+          // Changed fences belong to successors; failed delivery remains durable
+          // and can be retried by a later control poll without redispatch.
+        }).finally(() => {
+          if (this.cancellationControls.get(commandId) === control) {
+            this.cancellationControls.delete(commandId);
+          }
+        });
+        this.cancellationControls.set(commandId, control);
+      } catch {
+        // Store-read or fence races do not invalidate another command's poll.
+      }
+    }
   }
 
   async runOnce(): Promise<number> {
@@ -141,10 +175,20 @@ export class AsyncExecutionRuntime {
     await this.phase("outbox-claimed", command.id);
 
     try {
-      await this.withHeartbeat(fence, () => this.core.dispatchExecutionCommand(command.id, {
-        fence,
-        onPhase: (phase) => this.phase(phase, command.id)
-      }));
+      await this.withHeartbeat(fence, async () => {
+        this.activeDispatches.set(command.id, fence);
+        try {
+          await this.core.dispatchExecutionCommand(command.id, {
+            fence,
+            onPhase: (phase) => this.phase(phase, command.id)
+          });
+        } finally {
+          this.activeDispatches.delete(command.id);
+          // Keep this command's heartbeat and receipt owner alive until its own
+          // abort acknowledgement settles; unrelated control requests cannot block it.
+          await this.cancellationControls.get(command.id);
+        }
+      });
       await this.finalizeDelivery(command.id, claimed, fence);
       return 1;
     } catch (error) {
