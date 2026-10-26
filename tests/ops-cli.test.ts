@@ -240,7 +240,7 @@ describe("ops CLI black-box contract", { timeout: 30_000 }, () => {
 
   it("retains a lease when an owned provider preflight command times out", async () => {
     const f = await fixture();
-    await writeFile(join(f.root, "flow-provider.cjs"), "setTimeout(()=>process.exit(0),5000);setInterval(()=>{},1000);");
+    await writeFile(join(f.root, "flow-provider.cjs"), "#!/usr/bin/env node\nsetTimeout(()=>process.exit(0),5000);setInterval(()=>{},1000);\n");
     f.manifest.preflightTimeoutMs = 300;
     const { result } = await run(f);
     expect(result.code, result.stderr).toBe(11);
