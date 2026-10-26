@@ -10,7 +10,7 @@ import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { describe, expect } from "vitest";
 
 export const flowCliPath = process.env["ZIGMA_FLOW_CLI_PATH"];
@@ -143,15 +143,21 @@ export async function writeDieFiles(): Promise<void> {
 }
 
 export async function rmWithRetry(target: string, attempts = 8): Promise<void> {
+  const absolute = resolve(target);
+  const samePath = (left: string, right: string): boolean => process.platform === "win32"
+    ? left.toLowerCase() === right.toLowerCase() : left === right;
+  if (!samePath(dirname(absolute), resolve(tmpdir())) || !basename(absolute).startsWith("zigma-core-m4-")) {
+    throw new Error(`Refusing recursive cleanup outside an owned M4 temporary root: ${absolute}`);
+  }
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
-      await rm(target, { recursive: true, force: true });
+      await rm(absolute, { recursive: true, force: true });
       return;
     } catch {
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
   }
-  await rm(target, { recursive: true, force: true });
+  await rm(absolute, { recursive: true, force: true });
 }
 
 export async function waitFor<T>(
@@ -295,21 +301,45 @@ export function findPidByCommandLine(substring: string): number | undefined {
   return first ? Number(first) : undefined;
 }
 
-/** Kill a provider child and its own children (the step processes). */
+/** Snapshot descendants before any kill can reparent them; children precede parents. */
+export function processTreeKillOrder(pid: number, processTable: string): number[] {
+  if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) throw new Error("Unsafe provider process id");
+  const children = new Map<number, number[]>();
+  for (const line of processTable.split("\n")) {
+    const fields = line.trim().split(/\s+/);
+    if (fields.length !== 2) continue;
+    const child = Number(fields[0]), parent = Number(fields[1]);
+    if (!Number.isSafeInteger(child) || !Number.isSafeInteger(parent) || child <= 1 || parent < 0) continue;
+    const siblings = children.get(parent) ?? [];
+    siblings.push(child);
+    children.set(parent, siblings);
+  }
+  const seen = new Set<number>(), order: number[] = [];
+  const visit = (current: number): void => {
+    if (seen.has(current)) return;
+    seen.add(current);
+    for (const child of children.get(current) ?? []) visit(child);
+    order.push(current);
+  };
+  visit(pid);
+  return order;
+}
+
+/** Kill only the known provider tree; this is not a machine-wide orphan census. */
 export function killProcessTree(pid: number): void {
+  if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) throw new Error("Unsafe provider process id");
   if (process.platform === "win32") {
     execFileSync("taskkill", ["/F", "/T", "/PID", String(pid)]);
     return;
   }
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {
-    // already gone
-  }
-  try {
-    execFileSync("pkill", ["-KILL", "-P", String(pid)], { stdio: ["ignore", "pipe", "pipe"] });
-  } catch {
-    // best-effort; children may already be reparented
+  const processTable = execFileSync("ps", ["-eo", "pid=,ppid="], {
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"]
+  });
+  for (const ownedPid of processTreeKillOrder(pid, processTable)) {
+    try { process.kill(ownedPid, "SIGKILL"); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
   }
 }
 

@@ -1,0 +1,62 @@
+name: Published suite fault regression
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/m4/**'
+      - 'tests/run-published-suite*'
+      - 'tests/m4-helper-safety.test.ts'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/published-suite.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  m4-published:
+    name: ${{ matrix.os }} / ${{ matrix.core }} Core
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        core: [published, candidate]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - name: Verify the regression runner and cleanup boundaries
+        run: node node_modules/vitest/vitest.mjs run tests/run-published-suite.test.mjs tests/m4-helper-safety.test.ts
+      - name: Build candidate Core
+        if: matrix.core == 'candidate'
+        run: npm run build
+      - name: Run all six real M4 files with frozen published providers
+        shell: pwsh
+        run: |
+          $suiteArguments = @('tests/run-published-suite.mjs', '--artifacts-dir', '${{ runner.temp }}')
+          if ('${{ matrix.core }}' -eq 'candidate') {
+            $suiteArguments += @('--core-cli', '${{ github.workspace }}/dist/cli.js')
+          }
+          & node @suiteArguments
+          exit $LASTEXITCODE
+      - name: Retain exact package identities and failure evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-suite-${{ matrix.os }}-${{ matrix.core }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/zigma-published-suite-*/receipt.json
+            ${{ runner.temp }}/zigma-published-suite-*/suite-lock.json
+            ${{ runner.temp }}/zigma-published-suite-*/npm-pack-manifests.json
+            ${{ runner.temp }}/zigma-published-suite-*/runtime/package-lock.json
+            ${{ runner.temp }}/zigma-published-suite-*/m4-report.json
+            ${{ runner.temp }}/zigma-published-suite-*/*.log
