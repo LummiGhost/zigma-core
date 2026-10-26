@@ -1,6 +1,6 @@
 {
   "name": "@zigma-ai/zigma-core",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Zigma platform control plane for projects, tasks, permissions, approvals, and evidence.",
   "license": "Apache-2.0",
   "repository": {
@@ -28,15 +28,16 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "npm run build && vitest run",
     "test:readiness": "node tests/run-readiness.mjs",
     "test:published-suite": "node tests/run-published-suite.mjs",
     "test:m0-cross-repo": "node tests/run-m0-cross-repo-contracts.mjs",
     "test:m3-cross-repo": "node tests/run-m3-cross-repo-contracts.mjs",
     "test:m4-cross-repo": "node tests/run-m4-cross-repo-contracts.mjs",
     "test:watch": "vitest",
-    "check": "npm run typecheck && npm test && npm run build",
-    "start": "node dist/cli.js"
+    "check": "npm run typecheck && npm test",
+    "start": "node dist/cli.js",
+    "test:ops-benchmark": "node tests/run-ops-benchmark.mjs"
   },
   "engines": {
     "node": ">=22.5.0"

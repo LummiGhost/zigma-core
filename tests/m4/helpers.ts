@@ -181,10 +181,18 @@ export function workspaceEnvelope(stateDir: string, ...args: string[]): {
   data?: unknown;
   error?: { code?: string; message?: string };
 } {
-  const stdout = execFileSync(process.execPath, [workspaceCliPath!, "--state-dir", stateDir, ...args, "--json"], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  let stdout: string;
+  try {
+    stdout = execFileSync(process.execPath, [workspaceCliPath!, "--state-dir", stateDir, ...args, "--json"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    // Vitest's JSON reporter omits execFileSync's extra stdout/stderr fields.
+    // Preserve the provider's actual failure in the retained M4 evidence.
+    const failed = error as { stdout?: string | Buffer; stderr?: string | Buffer; status?: number; signal?: string };
+    throw new Error(`workspace CLI ${args[0]} failed (status=${failed.status}, signal=${failed.signal}): ${String(failed.stdout ?? "")}\n${String(failed.stderr ?? "")}`, { cause: error });
+  }
   const envelope = JSON.parse(stdout) as {
     contract_version: number;
     ok: boolean;
