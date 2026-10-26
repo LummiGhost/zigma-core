@@ -1,5 +1,9 @@
 # CLAUDE.md
 
+@AGENTS.md
+
+AGENTS.md defines the repository workflow. The reference below describes module boundaries.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Commands
@@ -9,7 +13,7 @@ npm run typecheck      # type-check without emitting
 npm test               # run all tests once (Vitest)
 npm run test:watch     # run tests in watch mode
 npm run build          # compile TypeScript → dist/
-npm run check          # full gate: typecheck + test + build
+npm run check          # full gate: typecheck + build + test
 ```
 
 Run a single test file:
@@ -54,5 +58,5 @@ contracts  ←  domain  ←  application  ←  persistence
 - **Zod 4** is used for all schema validation; the API has not been migrated to any v3 compatibility shim.
 - `SqliteStore` uses the synchronous `DatabaseSync` API — no async/await in persistence code.
 - `HumanDecision` and `PermissionSnapshot` rows are **immutable** once written; never update them.
-- FlowEvent callbacks are **idempotent** — duplicate delivery of the same `(flow_run_id, status)` pair is a no-op.
+- Versioned FlowEvent callbacks are **idempotent by event ID and content**. Replaying the same event is a no-op; reusing its ID with different content or sending a noncontiguous sequence is rejected. Distinct events may legitimately share a status.
 - State transitions are enforced by `src/domain/state-machines.ts` before any DB write.

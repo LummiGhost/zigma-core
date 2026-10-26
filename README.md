@@ -91,6 +91,15 @@ Health check:
 curl http://127.0.0.1:4736/health
 ```
 
+## Standard operator workflow
+
+Core 0.1.4 adds `ops run`, `ops report` and `ops note` for HTTP task execution,
+independent acceptance, local artifact delivery and comparable batch receipts.
+See the [operator guide](docs/operations.md) for setup, a replaceable manifest,
+unknown-run recovery, published-suite regression and the explicitly selected
+synthetic/live-model benchmark. These commands use an existing Core service;
+they do not merge code or establish OS isolation.
+
 ## Bootstrap through the CLI
 
 Create an execution profile:
