@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { Command } from "commander";
@@ -11,6 +11,10 @@ import { LocalCliFlowExecutor } from "./adapters/local-cli-flow.js";
 import { ZigmaWorkspaceCliAdapter } from "./adapters/zigma-workspace-cli.js";
 import { buildServer } from "./api/server.js";
 import { SqliteStore } from "./persistence/sqlite-store.js";
+import { appendNote, buildReport } from "./operations/report.js";
+import { runOps } from "./operations/runner.js";
+import { EXIT_CONTRACT, EXIT_OK, OpsError, errorMessage, type OpsExitCode } from "./operations/schema.js";
+import { packageVersion } from "./version.js";
 
 async function readJson(path: string): Promise<unknown> {
   return JSON.parse(await readFile(resolve(path), "utf8")) as unknown;
@@ -59,13 +63,78 @@ function print(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
+function printOps(value: unknown, exitCode: OpsExitCode): void {
+  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+  process.exitCode = exitCode;
+}
+
+function printOpsError(message: string, exitCode: OpsExitCode): void {
+  process.stdout.write(`${JSON.stringify({ schema: "zigma.ops.error/1", error: { message }, exitCode }, null, 2)}\n`);
+  process.exitCode = exitCode;
+}
+
+/**
+ * Run an ops action and map every failure to a contract exit code. Ops
+ * failures never escape to an unhandled rejection or a silent success exit.
+ */
+async function runOpsCommand(action: () => Promise<boolean>): Promise<void> {
+  try {
+    const printed = await action();
+    if (!printed) printOpsError("operations command produced no output", EXIT_CONTRACT);
+  } catch (error) {
+    const code: OpsExitCode = error instanceof OpsError ? error.exitCode : EXIT_CONTRACT;
+    printOpsError(errorMessage(error), code);
+  }
+}
+
 async function main(): Promise<void> {
   const program = new Command();
   program
     .name("zigma-core")
     .description("Zigma platform control plane")
-    .version((JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version)
+    .version(packageVersion)
     .option("--db <path>", "SQLite database path", ".zigma-core/core.db");
+
+  // Operations commands are HTTP-only and registered before any store-opening
+  // command; their handlers never open the local SQLite store.
+  const ops = program.command("ops").description("Operator receipts (HTTP only; never opens the local store)");
+  ops
+    .command("run")
+    .description("Run a manifest batch against a local Core server")
+    .requiredOption("--manifest <file>", "Operations manifest path")
+    .requiredOption("--out <directory>", "New batch output directory (must not exist)")
+    .action(async (options: { manifest: string; out: string }) => {
+      await runOpsCommand(async () => {
+        const { output, exitCode } = await runOps({ manifestPath: options.manifest, outPath: options.out });
+        printOps(output, exitCode);
+        return true;
+      });
+    });
+  ops
+    .command("report")
+    .description("Summarize one batch directory or a parent of batch directories")
+    .requiredOption("--dir <directory>", "Batch directory or parent directory")
+    .action(async (options: { dir: string }) => {
+      await runOpsCommand(async () => {
+        const report = await buildReport(options.dir);
+        printOps(report, EXIT_OK);
+        return true;
+      });
+    });
+  ops
+    .command("note")
+    .description("Append a self-reported operator note to a batch")
+    .requiredOption("--dir <directory>", "Batch directory")
+    .requiredOption("--task <key>", "Planned task key")
+    .requiredOption("--kind <kind>", "review|repair|reset|retry|other")
+    .requiredOption("--reason <text>", "Non-empty reason")
+    .action(async (options: { dir: string; task: string; kind: string; reason: string }) => {
+      await runOpsCommand(async () => {
+        const result = await appendNote({ dir: options.dir, key: options.task, kind: options.kind, reason: options.reason });
+        printOps(result, EXIT_OK);
+        return true;
+      });
+    });
 
   program
     .command("serve")
@@ -206,7 +275,11 @@ async function main(): Promise<void> {
 }
 
 main().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error);
+  if (error instanceof OpsError) {
+    printOpsError(errorMessage(error), error.exitCode);
+    return;
+  }
+  const message = errorMessage(error);
   process.stderr.write(`${JSON.stringify({ error: { message } }, null, 2)}\n`);
   process.exitCode = 1;
 });

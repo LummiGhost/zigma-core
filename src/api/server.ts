@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { ZodError } from "zod";
 import { CoreService } from "../application/core-service.js";
 import { CoreError } from "../domain/errors.js";
+import { packageVersion } from "../version.js";
 
 export function buildServer(core: CoreService): FastifyInstance {
   const app = Fastify({ logger: true });
@@ -34,7 +35,8 @@ export function buildServer(core: CoreService): FastifyInstance {
     });
   });
 
-  app.get("/health", async () => ({ ok: true, service: "zigma-core" }));
+  // Additive identity fields: operator receipts identify the actual Core server.
+  app.get("/health", async () => ({ ok: true, service: "zigma-core", version: packageVersion }));
 
   app.post("/v1/execution-profiles", async (request, reply) => {
     const profile = core.createExecutionProfile(request.body as never);

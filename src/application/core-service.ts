@@ -120,6 +120,7 @@ export interface DispatchExecutionOptions {
 }
 
 type FlowResultProjection = {
+  quiescent?: boolean;
   externalRunId: string;
   status: FlowRun["status"];
   exitCode?: number;
@@ -1237,6 +1238,7 @@ export class CoreService {
       status: result.status,
       ...(result.exitCode !== undefined ? { exitCode: result.exitCode } : {}),
       ...(result.summary !== undefined ? { summary: result.summary } : {}),
+      ...(result.quiescent !== undefined ? { quiescent: result.quiescent } : {}),
       metadata: result.metadata
     };
   }
