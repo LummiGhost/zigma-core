@@ -348,7 +348,7 @@ test runner or Vitest dependency.
 
 ```powershell
 npm ci
-npm run test:published-suite -- --artifacts-dir 'C:/ops-regressions'
+node tests/run-published-suite.mjs --artifacts-dir 'C:/ops-regressions'
 ```
 
 This resolves each package's npm `latest` once, downloads and verifies immutable
@@ -364,7 +364,7 @@ Flow/Workspace packages:
 
 ```powershell
 npm run build
-npm run test:published-suite -- --core-cli './dist/cli.js' `
+node tests/run-published-suite.mjs --core-cli './dist/cli.js' `
   --artifacts-dir 'C:/ops-regressions'
 ```
 
@@ -384,7 +384,7 @@ are **JavaScript CLI entry files**, not `.cmd` shims.
 
 ```powershell
 npm run build
-npm run test:ops-benchmark -- --mode deterministic `
+node tests/run-ops-benchmark.mjs --mode deterministic `
   --flow-cli 'C:/zigma-runtime/node_modules/@zigma-ai/zigma-flow/dist/cli.js' `
   --workspace-cli 'C:/zigma-runtime/node_modules/@zigma-ai/zigma-workspace/dist/cli/index.js' `
   --artifacts-dir 'C:/ops-benchmarks'
@@ -396,7 +396,7 @@ no model repair. An actual model call requires **both** explicit live mode and
 a Claude CLI path, using the operator's existing authentication/routing:
 
 ```powershell
-npm run test:ops-benchmark -- --mode live-model `
+node tests/run-ops-benchmark.mjs --mode live-model `
   --claude-cli 'C:/tools/claude.exe' --model-route 'operator-verified-route' `
   --flow-cli 'C:/zigma-runtime/node_modules/@zigma-ai/zigma-flow/dist/cli.js' `
   --workspace-cli 'C:/zigma-runtime/node_modules/@zigma-ai/zigma-workspace/dist/cli/index.js' `
